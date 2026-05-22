@@ -25,6 +25,20 @@ export interface ScrapeCollectResult {
   skipped: number
   errors: number
   sellerNickname?: string
+  stats?: ScrapeCollectStats
+}
+
+export interface ScrapeCollectStats {
+  fetched: number
+  parsed: number
+  strong: number
+  partial: number
+  weak: number
+  failed: number
+  duplicates: number
+  invalid: number
+  autoSkipped: number
+  avgQuality: number
 }
 
 export const SCRAPE_CSV_HEADERS = [
@@ -37,6 +51,12 @@ export const SCRAPE_CSV_HEADERS = [
   'state',
   'municipio',
   'image_url',
+  'quality_score',
+  'quality_status',
+  'parser_name',
+  'parser_status',
+  'canonical_url',
+  'missing_fields',
   'category',
   'listing_type',
   'condition',
@@ -66,6 +86,12 @@ export function scrapeItemsToCsv(items: ScrapeCollectedItem[]): string {
       item.state ?? '',
       item.municipio ?? '',
       item.image_url ?? '',
+      item.raw_data?.quality_score ?? '',
+      item.raw_data?.quality_status ?? '',
+      item.raw_data?.parser_name ?? '',
+      item.raw_data?.parser_status ?? '',
+      item.raw_data?.canonical_url ?? '',
+      Array.isArray(item.raw_data?.quality_missing) ? item.raw_data.quality_missing.join('|') : '',
       item.category ?? '',
       item.listing_type,
       item.condition ?? '',

@@ -13,6 +13,7 @@
 import { db } from '../supabase'
 import type { ScrapeCollectedItem, ScrapeCollectResult } from '../adminScrapeExport'
 import type { ScrapeResult } from './serpapi'
+import { summarizeCollectedItems, withQuality } from './quality'
 
 export interface MLScrapeParams {
   query: string
@@ -42,12 +43,81 @@ function slugify(text: string): string {
     .slice(0, 48)
 }
 
-/** Fetch a page and return { title, image, priceCents, currency } from OG meta tags + title parsing. */
+function decodeHtml(text: string | null | undefined): string | null {
+  if (!text) return null
+  return text
+    .replace(/&quot;/g, '"')
+    .replace(/&#34;/g, '"')
+    .replace(/&amp;/g, '&')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function getAttr(tag: string, name: string): string | null {
+  const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']+)["']`, 'i'))
+  return decodeHtml(match?.[1]) ?? null
+}
+
+function metaValues(html: string): Array<{ key: string; content: string }> {
+  const values: Array<{ key: string; content: string }> = []
+  const re = /<meta\b[^>]*>/gi
+  for (const match of html.matchAll(re)) {
+    const tag = match[0]
+    const key = getAttr(tag, 'property') ?? getAttr(tag, 'name') ?? getAttr(tag, 'itemprop')
+    const content = getAttr(tag, 'content')
+    if (key && content) values.push({ key: key.toLowerCase(), content })
+  }
+  return values
+}
+
+function firstMeta(meta: Array<{ key: string; content: string }>, keys: string[]): string | null {
+  const wanted = new Set(keys.map(key => key.toLowerCase()))
+  return meta.find(item => wanted.has(item.key))?.content ?? null
+}
+
+function allMeta(meta: Array<{ key: string; content: string }>, keys: string[]): string[] {
+  const wanted = new Set(keys.map(key => key.toLowerCase()))
+  return meta.filter(item => wanted.has(item.key)).map(item => item.content)
+}
+
+function parsePrice(value: string | null): number | null {
+  if (!value) return null
+  const match = value.match(/(?:MXN|M\.N\.|\$)?\s*([\d.,]+)/i)
+  if (!match) return null
+  const text = match[1].includes(',') ? match[1].replace(/,/g, '') : match[1]
+  const priceNum = Number.parseFloat(text)
+  if (!Number.isFinite(priceNum) || priceNum <= 0) return null
+  return Math.round(priceNum * 100)
+}
+
+function canonicalUrl(html: string, pageUrl: string): string | null {
+  const linkTags = html.match(/<link\b[^>]*>/gi) ?? []
+  for (const tag of linkTags) {
+    if ((getAttr(tag, 'rel') ?? '').toLowerCase() !== 'canonical') continue
+    const href = getAttr(tag, 'href')
+    if (!href) continue
+    try {
+      return new URL(href, pageUrl).toString()
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+/** Fetch a page and return parsed listing fields from OG/meta tags + title parsing. */
 async function fetchOgData(url: string): Promise<{
   title: string | null
+  description: string | null
   image: string | null
+  images: string[]
   priceCents: number | null
   currency: string | null
+  canonicalUrl: string | null
+  parserNotes: string[]
 }> {
   try {
     const res = await fetch(url, {
@@ -55,38 +125,50 @@ async function fetchOgData(url: string): Promise<{
       signal: AbortSignal.timeout(6000),
       cache: 'no-store',
     })
-    if (!res.ok) return { title: null, image: null, priceCents: null, currency: null }
+    if (!res.ok) {
+      return { title: null, description: null, image: null, images: [], priceCents: null, currency: null, canonicalUrl: null, parserNotes: ['fetch_not_ok'] }
+    }
     const html = await res.text()
+    const meta = metaValues(html)
 
-    const rawTitle = html.match(/property="og:title"\s+content="([^"]+)"/)?.[1]
-      ?? html.match(/content="([^"]+)"\s+property="og:title"/)?.[1]
-      ?? html.match(/<title>([^<]+)/)?.[1]
+    const rawTitle = firstMeta(meta, ['og:title', 'twitter:title'])
+      ?? decodeHtml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/<[^>]+>/g, ''))
       ?? null
 
-    const image = html.match(/property="og:image"\s+content="([^"]+)"/)?.[1]
-      ?? html.match(/content="([^"]+)"\s+property="og:image"/)?.[1]
+    const description = firstMeta(meta, ['og:description', 'twitter:description', 'description'])
+    const images = allMeta(meta, ['og:image', 'twitter:image', 'image']).filter((value, index, list) => list.indexOf(value) === index)
+    const image = images[0]
       ?? null
+    const canonical = canonicalUrl(html, url)
 
     // ML puts price in the OG title: "Volkswagen Transporter 9 PASAJEROS - $ 599,900"
     // Extract and clean
     let title = rawTitle
-    let priceCents: number | null = null
-    const currency: string | null = 'MXN'
+    let priceCents: number | null =
+      parsePrice(firstMeta(meta, ['product:price:amount', 'og:price:amount', 'price']))
+    const currency: string | null = firstMeta(meta, ['product:price:currency', 'og:price:currency']) ?? 'MXN'
 
     if (rawTitle) {
-      const priceMatch = rawTitle.match(/[-–]\s*\$\s*([\d,]+(?:\.\d+)?)/)
+      const priceMatch = rawTitle.match(/[-–]\s*(?:MXN|M\.N\.|\$)\s*([\d,]+(?:\.\d+)?)/i)
+      if (priceMatch && !priceCents) {
+        priceCents = parsePrice(priceMatch[0])
+      }
       if (priceMatch) {
-        const priceNum = parseFloat(priceMatch[1].replace(/,/g, ''))
-        if (priceNum > 0) priceCents = Math.round(priceNum * 100)
         title = rawTitle.replace(/\s*[-–]\s*\$\s*[\d,]+(?:\.\d+)?/, '').replace(/\s*\|\s*MercadoLibre\s*$/, '').trim()
       } else {
         title = rawTitle.replace(/\s*\|\s*MercadoLibre\s*$/, '').trim()
       }
     }
 
-    return { title, image, priceCents, currency }
+    const parserNotes: string[] = []
+    if (!priceCents) parserNotes.push('price_not_found')
+    if (!image) parserNotes.push('image_not_found')
+    if (!description) parserNotes.push('description_not_found')
+    if (!canonical) parserNotes.push('canonical_not_found')
+
+    return { title: decodeHtml(title), description, image, images, priceCents, currency, canonicalUrl: canonical, parserNotes }
   } catch {
-    return { title: null, image: null, priceCents: null, currency: null }
+    return { title: null, description: null, image: null, images: [], priceCents: null, currency: null, canonicalUrl: null, parserNotes: ['fetch_error'] }
   }
 }
 
@@ -204,6 +286,7 @@ export async function scrapeMLSeller(params: MLSellerScrapeParams): Promise<Scra
         .insert({
           shop_id: shopId,
           title: item.listing_title.slice(0, 200),
+          description: item.listing_description ?? null,
           price_cents: item.price_cents ?? null,
           currency: item.currency ?? 'MXN',
           listing_type: 'product',
@@ -213,7 +296,12 @@ export async function scrapeMLSeller(params: MLSellerScrapeParams): Promise<Scra
           source_url: item.source_url,
           images: item.image_url ? [{ url: item.image_url, alt: item.listing_title }] : [],
           status: 'active',
-          metadata: { ml_item_id: item.source_id, seller_nickname: nickname },
+          metadata: {
+            ml_item_id: item.source_id,
+            seller_nickname: nickname,
+            quality_score: item.raw_data?.quality_score ?? null,
+            parser_notes: item.raw_data?.parser_notes ?? [],
+          },
         })
 
       if (listErr) { errors++; continue }
@@ -272,7 +360,7 @@ export async function collectMLSeller(params: MLSellerScrapeParams): Promise<Scr
     }
   }
 
-  let skipped = 0, errors = 0
+  let errors = 0
   const items: ScrapeCollectedItem[] = []
   const CONCURRENCY = 5
 
@@ -282,24 +370,38 @@ export async function collectMLSeller(params: MLSellerScrapeParams): Promise<Scr
       try {
         const itemIdMatch = itemUrl.match(/MLM[-_]?(\d+)/i)
         const mlItemId = itemIdMatch ? `MLM${itemIdMatch[1]}` : null
-        const { title: ogTitle, image: ogImage, priceCents, currency } = await fetchOgData(itemUrl)
-        const title = ogTitle ?? googleTitle
-        if (!title || title.length < 5) { skipped++; return null }
+        const parsed = await fetchOgData(itemUrl)
+        const title = parsed.title ?? googleTitle ?? itemUrl
+        const sourceUrl = parsed.canonicalUrl ?? itemUrl
 
-        return {
+        const item: ScrapeCollectedItem = {
           source_platform: 'mercadolibre',
-          source_url: itemUrl,
+          source_url: sourceUrl,
           source_id: mlItemId,
           shop_name: displayName || nickname,
           shop_source_url: sellerPageUrl,
           listing_title: title.slice(0, 200),
-          price_cents: priceCents,
-          currency: currency ?? 'MXN',
+          listing_description: parsed.description,
+          price_cents: parsed.priceCents,
+          currency: parsed.currency ?? 'MXN',
           listing_type: 'product',
           category: category ?? null,
-          image_url: ogImage,
-          raw_data: { google_title: googleTitle, seller_nickname: nickname },
-        } satisfies ScrapeCollectedItem
+          image_url: parsed.image,
+          raw_data: {
+            google_title: googleTitle,
+            seller_nickname: nickname,
+            canonical_url: sourceUrl,
+            serpapi_link: itemUrl,
+            all_image_urls: parsed.images,
+            original_link_valid: /mercadolibre\.com\.mx/i.test(sourceUrl),
+          },
+        }
+        return withQuality(item, {
+          parserName: 'mercadolibre_seller_html',
+          parserStatus: 'parsed',
+          parserAttempts: ['og_meta', 'canonical_link', 'title_price'],
+          parserNotes: parsed.parserNotes,
+        })
       } catch {
         errors++
         return null
@@ -308,7 +410,18 @@ export async function collectMLSeller(params: MLSellerScrapeParams): Promise<Scr
     items.push(...batchItems.filter(item => item !== null))
   }
 
-  return { items, skipped, errors, sellerNickname: displayName }
+  return {
+    items,
+    skipped: 0,
+    errors,
+    sellerNickname: displayName,
+    stats: summarizeCollectedItems(items, {
+      fetched: collectedItems.length,
+      parsed: items.length,
+      failed: errors,
+      autoSkipped: 0,
+    }),
+  }
 }
 
 /**

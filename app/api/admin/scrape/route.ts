@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/supabase'
 import { collectSerpApiLocal, scrapeSerpApiLocal } from '@/lib/scrapers/serpapi'
 import { collectMLSeller, scrapeMercadoLibre, scrapeMLSeller } from '@/lib/scrapers/mercadolibre'
+import { collectTargetedWebsiteSearch } from '@/lib/scrapers/targeted'
 import { saveScrapeRunItems, type ScrapeCollectResult } from '@/lib/adminScrapeExport'
+import type { TargetSearchSiteKey } from '@/lib/types'
 
 function checkSecret(req: NextRequest): boolean {
   const secret = req.headers.get('x-admin-secret') ?? req.nextUrl.searchParams.get('secret')
@@ -15,7 +17,7 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json() as {
-    source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller'
+    source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller' | 'targeted_website_search'
     mode?: 'collect_only' | 'direct_import'
     params: Record<string, string | number>
   }
@@ -91,6 +93,15 @@ export async function POST(req: NextRequest) {
         category: params.category ? String(params.category) : undefined,
         limit: Number(params.limit ?? 50),
       })
+    } else if (source === 'targeted_website_search') {
+      result = await collectTargetedWebsiteSearch({
+        query: String(params.query ?? ''),
+        targetSite: String(params.targetSite ?? 'mercadolibre') as TargetSearchSiteKey,
+        category: params.category ? String(params.category) : undefined,
+        state: params.state ? String(params.state) : undefined,
+        location: params.location ? String(params.location) : undefined,
+        limit: Number(params.limit ?? 20),
+      })
     } else if (source === 'mercadolibre_public') {
       throw new Error('ML keyword search remains blocked for Mexico. Use Seller Targeting or the new /supply CSV workflow.')
     } else {
@@ -115,6 +126,7 @@ export async function POST(req: NextRequest) {
       skipped: result.skipped,
       errors: result.errors,
       sellerNickname: result.sellerNickname,
+      stats: result.stats,
     })
   } catch (e) {
     await db.from('marketplace_scrape_runs').update({

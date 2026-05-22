@@ -1,5 +1,6 @@
 import { db } from '../supabase'
 import type { ScrapeCollectedItem, ScrapeCollectResult } from '../adminScrapeExport'
+import { summarizeCollectedItems, withQuality } from './quality'
 
 export interface SerpApiScrapeParams {
   query: string       // e.g. "taller mecánico"
@@ -147,19 +148,16 @@ export async function collectSerpApiLocal(params: SerpApiScrapeParams): Promise<
   if (data.error) throw new Error(`SerpAPI error: ${data.error}`)
   const results: SerpLocalResult[] = (data.local_results ?? []).slice(0, limit)
 
-  let skipped = 0, errors = 0
+  let errors = 0
   const items: ScrapeCollectedItem[] = []
 
   for (const r of results) {
     try {
-      // Quality gate - min score 2 to collect
-      if (qualityScore(r) < 2) { skipped++; continue }
-
       const sourceUrl = r.place_id
         ? `https://maps.google.com/?cid=${r.place_id}`
         : `serpapi://local/${encodeURIComponent(r.title + '|' + (r.address ?? location))}`
 
-      items.push({
+      const item: ScrapeCollectedItem = {
         source_platform: 'google_local',
         source_url: sourceUrl,
         source_id: r.place_id ?? null,
@@ -173,12 +171,36 @@ export async function collectSerpApiLocal(params: SerpApiScrapeParams): Promise<
         state,
         location: r.address ?? location,
         image_url: r.thumbnail ?? null,
-        raw_data: { ...r, query, location },
-      })
+        raw_data: {
+          ...r,
+          query,
+          location,
+          google_local_quality_score: qualityScore(r),
+          quality_gate_enabled: false,
+          original_link_valid: true,
+          canonical_url: sourceUrl,
+        },
+      }
+      items.push(withQuality(item, {
+        parserName: 'serpapi_google_local',
+        parserStatus: 'collected',
+        parserAttempts: ['serpapi_local_results'],
+        parserNotes: qualityScore(r) < 2 ? ['below_legacy_quality_gate'] : [],
+      }))
     } catch {
       errors++
     }
   }
 
-  return { items, skipped, errors }
+  return {
+    items,
+    skipped: 0,
+    errors,
+    stats: summarizeCollectedItems(items, {
+      fetched: results.length,
+      parsed: items.length,
+      failed: errors,
+      autoSkipped: 0,
+    }),
+  }
 }

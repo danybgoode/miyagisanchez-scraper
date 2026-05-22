@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
-import { CATEGORIES } from '@/lib/types'
+import { CATEGORIES, TARGET_SEARCH_SITES } from '@/lib/types'
 
 interface ScrapeRun {
   id: string
@@ -24,6 +24,18 @@ interface RunResult {
   error?: string
   runId?: string
   sellerNickname?: string
+  stats?: {
+    fetched: number
+    parsed: number
+    strong: number
+    partial: number
+    weak: number
+    failed: number
+    duplicates: number
+    invalid: number
+    autoSkipped: number
+    avgQuality: number
+  }
 }
 
 function timeAgo(dateStr: string): string {
@@ -50,6 +62,13 @@ function StatusBadge({ status }: { status: string }) {
   )
 }
 
+function sourceLabel(source: string): string {
+  if (source === 'serpapi_google_local') return 'Google Local'
+  if (source === 'mercadolibre_seller') return 'ML Seller'
+  if (source === 'targeted_website_search') return 'Targeted Search'
+  return 'ML Keyword'
+}
+
 function ResultBanner({ result, loading, secret }: { result: RunResult | null; loading: boolean; secret: string }) {
   if (loading) return (
     <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 6, backgroundColor: '#f0f9ff', border: '1px solid #bae6fd', fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -66,15 +85,30 @@ function ResultBanner({ result, loading, secret }: { result: RunResult | null; l
           <pre style={{ margin: '6px 0 0', whiteSpace: 'pre-wrap', fontSize: 12, color: '#991b1b', fontFamily: 'monospace' }}>{result.error}</pre>
         </div>
       ) : (
-        <div style={{ display: 'flex', gap: 20, flexWrap: 'wrap' }}>
-          {result.sellerNickname && <span style={{ color: '#166534' }}>Seller: <strong>{result.sellerNickname}</strong></span>}
-          <span style={{ color: '#166534' }}>✓ <strong>{result.collected ?? result.inserted}</strong> collected</span>
-          <span style={{ color: '#6b7280' }}>⟳ <strong>{result.skipped}</strong> skipped</span>
-          {(result.errors ?? 0) > 0 && <span style={{ color: '#dc2626' }}>✗ <strong>{result.errors}</strong> errors</span>}
-          {result.runId && (
-            <a href={`/api/admin/runs/${result.runId}/csv?secret=${encodeURIComponent(secret)}`} style={{ color: '#166534', fontWeight: 600 }}>
-              Download CSV
-            </a>
+        <div>
+          <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'center' }}>
+            {result.sellerNickname && <span style={{ color: '#166534' }}>Seller: <strong>{result.sellerNickname}</strong></span>}
+            <span style={{ color: '#166534' }}>Collected <strong>{result.collected ?? result.inserted}</strong></span>
+            <span style={{ color: '#475569' }}>Auto-skipped <strong>{result.stats?.autoSkipped ?? result.skipped ?? 0}</strong></span>
+            {(result.errors ?? 0) > 0 && <span style={{ color: '#dc2626' }}>Errors <strong>{result.errors}</strong></span>}
+            {result.runId && (
+              <a href={`/api/admin/runs/${result.runId}/csv?secret=${encodeURIComponent(secret)}`} style={{ color: '#166534', fontWeight: 600 }}>
+                Download CSV
+              </a>
+            )}
+          </div>
+          {result.stats && (
+            <div style={{ marginTop: 8, display: 'flex', gap: 12, flexWrap: 'wrap', color: '#475569', fontSize: 12 }}>
+              <span>Fetched {result.stats.fetched}</span>
+              <span>Parsed {result.stats.parsed}</span>
+              <span>Quality {result.stats.avgQuality}/100</span>
+              <span>Strong {result.stats.strong}</span>
+              <span>Partial {result.stats.partial}</span>
+              <span>Weak {result.stats.weak}</span>
+              {(result.stats.duplicates > 0 || result.stats.invalid > 0) && (
+                <span>Filtered links {result.stats.duplicates + result.stats.invalid}</span>
+              )}
+            </div>
           )}
         </div>
       )}
@@ -103,6 +137,15 @@ interface MLSellerFormState {
   limit: string
 }
 
+interface TargetedFormState {
+  query: string
+  targetSite: string
+  category: string
+  location: string
+  state: string
+  limit: string
+}
+
 export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [runs, setRuns] = useState<ScrapeRun[]>([])
   const [serpForm, setSerpForm] = useState<SerpApiFormState>({
@@ -123,13 +166,23 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     category: 'electronica',
     limit: '50',
   })
+  const [targetedForm, setTargetedForm] = useState<TargetedFormState>({
+    query: '',
+    targetSite: 'mercadolibre',
+    category: 'autos',
+    location: 'Ciudad de México, Mexico',
+    state: 'Ciudad de México',
+    limit: '20',
+  })
 
   const [serpLoading, setSerpLoading] = useState(false)
   const [mlLoading, setMlLoading] = useState(false)
   const [mlSellerLoading, setMlSellerLoading] = useState(false)
+  const [targetedLoading, setTargetedLoading] = useState(false)
   const [serpResult, setSerpResult] = useState<RunResult | null>(null)
   const [mlResult, setMlResult] = useState<RunResult | null>(null)
   const [mlSellerResult, setMlSellerResult] = useState<RunResult | null>(null)
+  const [targetedResult, setTargetedResult] = useState<RunResult | null>(null)
 
   const fetchRuns = useCallback(async () => {
     const res = await fetch(`/api/admin/runs?secret=${encodeURIComponent(secret)}`)
@@ -231,6 +284,37 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     }
   }
 
+  async function runTargeted(e: React.FormEvent) {
+    e.preventDefault()
+    setTargetedLoading(true)
+    setTargetedResult(null)
+    try {
+      const res = await fetch('/api/admin/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
+        body: JSON.stringify({
+          source: 'targeted_website_search',
+          mode: 'collect_only',
+          params: {
+            query: targetedForm.query,
+            targetSite: targetedForm.targetSite,
+            category: targetedForm.category,
+            location: targetedForm.location,
+            state: targetedForm.state,
+            limit: Number(targetedForm.limit),
+          },
+        }),
+      })
+      const json = await res.json() as RunResult
+      setTargetedResult(json)
+      await fetchRuns()
+    } catch (err) {
+      setTargetedResult({ error: String(err) })
+    } finally {
+      setTargetedLoading(false)
+    }
+  }
+
   const input: React.CSSProperties = {
     width: '100%', padding: '8px 10px',
     border: '1px solid #d1d5db', borderRadius: 6,
@@ -309,6 +393,66 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
             </button>
           </form>
           <ResultBanner result={serpResult} loading={serpLoading} secret={secret} />
+        </div>
+
+        {/* Targeted website search */}
+        <div style={{ ...card, border: '2px solid #2563eb' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+            <h2 style={{ ...sectionTitle, margin: 0 }}>Targeted Website Search</h2>
+            <span style={{ backgroundColor: '#eff6ff', color: '#1d4ed8', fontSize: 12, fontWeight: 600, padding: '2px 8px', borderRadius: 20, border: '1px solid #bfdbfe' }}>Quality gate disabled</span>
+          </div>
+          <p style={sectionSub}>
+            Search one marketplace at a time through Google, fetch each result, parse listing fields, and show quality diagnostics in the CSV.
+          </p>
+          <form onSubmit={(e) => { void runTargeted(e) }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+              <div style={field}>
+                <label style={label}>Website</label>
+                <select
+                  style={input}
+                  value={targetedForm.targetSite}
+                  onChange={e => {
+                    const site = TARGET_SEARCH_SITES.find(item => item.key === e.target.value)
+                    setTargetedForm(f => ({
+                      ...f,
+                      targetSite: e.target.value,
+                      category: site?.defaultCategory ?? f.category,
+                    }))
+                  }}
+                >
+                  {TARGET_SEARCH_SITES.map(site => <option key={site.key} value={site.key}>{site.label}</option>)}
+                </select>
+                <p style={hint}>{TARGET_SEARCH_SITES.find(site => site.key === targetedForm.targetSite)?.queryPrefix}</p>
+              </div>
+              <div style={field}>
+                <label style={label}>Query</label>
+                <input style={input} value={targetedForm.query} onChange={e => setTargetedForm(f => ({ ...f, query: e.target.value }))} placeholder="honda civic cdmx, departamento roma..." required />
+              </div>
+              <div style={field}>
+                <label style={label}>Category</label>
+                <select style={input} value={targetedForm.category} onChange={e => setTargetedForm(f => ({ ...f, category: e.target.value }))}>
+                  {CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Limit</label>
+                <input style={input} type="number" min={1} max={50} value={targetedForm.limit} onChange={e => setTargetedForm(f => ({ ...f, limit: e.target.value }))} />
+              </div>
+              <div style={field}>
+                <label style={label}>Location</label>
+                <input style={input} value={targetedForm.location} onChange={e => setTargetedForm(f => ({ ...f, location: e.target.value }))} placeholder="Ciudad de México, Mexico" />
+              </div>
+              <div style={field}>
+                <label style={label}>State (DB field)</label>
+                <input style={input} value={targetedForm.state} onChange={e => setTargetedForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
+              </div>
+            </div>
+            <button type="submit" style={btn(targetedLoading)} disabled={targetedLoading}>
+              {targetedLoading && <Spinner />}
+              {targetedLoading ? 'Collecting targeted rows...' : 'Collect Targeted Rows'}
+            </button>
+          </form>
+          <ResultBanner result={targetedResult} loading={targetedLoading} secret={secret} />
         </div>
 
         {/* ── ML Keyword ──────────────────────────── */}
@@ -405,7 +549,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
               <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
                 <thead>
                   <tr style={{ borderBottom: '2px solid #e5e7eb' }}>
-                    {['Source', 'Params', 'Status', 'Rows', '⟳', '✗', 'CSV', 'Started'].map(h => (
+                    {['Source', 'Params', 'Status', 'Rows', 'Auto-skip', 'Errors', 'CSV', 'Started'].map(h => (
                       <th key={h} style={{ textAlign: 'left', padding: '6px 10px', color: '#6b7280', fontWeight: 600 }}>{h}</th>
                     ))}
                   </tr>
@@ -414,13 +558,13 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                   {runs.map(run => (
                     <tr key={run.id} style={{ borderBottom: '1px solid #f3f4f6' }}>
                       <td style={{ padding: '8px 10px', fontWeight: 500, whiteSpace: 'nowrap' }}>
-                        {run.source === 'serpapi_google_local' ? '🔍 Google Local'
-                          : run.source === 'mercadolibre_seller' ? '🎯 ML Seller'
-                          : '🛒 ML Keyword'}
+                        {sourceLabel(run.source)}
                       </td>
                       <td style={{ padding: '8px 10px', color: '#6b7280', maxWidth: 200 }}>
                         <span title={JSON.stringify(run.params)} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block', fontSize: 12 }}>
-                          {run.params.sellerUrl
+                          {run.params.targetSite
+                            ? `${String(run.params.targetSite)}: "${String(run.params.query ?? '')}"`
+                            : run.params.sellerUrl
                             ? String(run.params.sellerUrl).slice(0, 40) + '…'
                             : run.params.query ? `"${run.params.query}"` : JSON.stringify(run.params)}
                         </span>
