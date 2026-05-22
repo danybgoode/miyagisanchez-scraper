@@ -113,6 +113,7 @@ export async function POST(req: NextRequest) {
         state: params.state ? String(params.state) : undefined,
         location: params.location ? String(params.location) : undefined,
         limit: Number(params.limit ?? 20),
+        apiKey,
       })
     } else if (source === 'mercadolibre_public') {
       throw new Error('ML keyword search remains blocked for Mexico. Use Seller Targeting or the new /supply CSV workflow.')
@@ -144,6 +145,7 @@ export async function POST(req: NextRequest) {
       sellerNickname: result.sellerNickname,
       stats: result.stats,
       csvData,
+      items: result.items,
     })
   } catch (e) {
     if (hasDb && dbRunId) {

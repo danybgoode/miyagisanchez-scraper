@@ -1,5 +1,10 @@
 import { db } from './supabase'
 
+export interface FieldCandidate {
+  value: string | number
+  source: string
+}
+
 export interface ScrapeCollectedItem {
   source_platform: string
   source_url: string | null
@@ -17,7 +22,14 @@ export interface ScrapeCollectedItem {
   municipio?: string | null
   location?: string | null
   image_url?: string | null
-  raw_data?: Record<string, unknown>
+  raw_data?: Record<string, unknown> & {
+    candidates?: {
+      title?: FieldCandidate[]
+      description?: FieldCandidate[]
+      priceCents?: FieldCandidate[]
+      imageUrl?: FieldCandidate[]
+    }
+  }
 }
 
 export interface ScrapeCollectResult {

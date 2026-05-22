@@ -1,4 +1,4 @@
-import type { ScrapeCollectedItem, ScrapeCollectResult } from '../adminScrapeExport'
+import type { FieldCandidate, ScrapeCollectedItem, ScrapeCollectResult } from '../adminScrapeExport'
 import { TARGET_SEARCH_SITES, type TargetSearchSiteKey } from '../types'
 import { summarizeCollectedItems, withQuality } from './quality'
 
@@ -32,6 +32,12 @@ interface ParsedListing {
   contactUrl: string | null
   attempts: string[]
   notes: string[]
+  candidates: {
+    title: FieldCandidate[]
+    description: FieldCandidate[]
+    priceCents: FieldCandidate[]
+    imageUrl: FieldCandidate[]
+  }
 }
 
 const TARGET_SITE_MAP = Object.fromEntries(TARGET_SEARCH_SITES.map(site => [site.key, site]))
@@ -69,6 +75,11 @@ function metaValues(html: string): Array<{ key: string; content: string }> {
 function firstMeta(meta: Array<{ key: string; content: string }>, keys: string[]): string | null {
   const wanted = new Set(keys.map(key => key.toLowerCase()))
   return meta.find(item => wanted.has(item.key))?.content ?? null
+}
+
+function allMetaValues(meta: Array<{ key: string; content: string }>, keys: string[]): Array<{ value: string; source: string }> {
+  const wanted = new Set(keys.map(key => key.toLowerCase()))
+  return meta.filter(item => wanted.has(item.key)).map(item => ({ value: item.content, source: `meta:${item.key}` }))
 }
 
 function titleTag(html: string): string | null {
@@ -175,6 +186,65 @@ function jsonOfferValue(json: unknown[], key: 'price' | 'priceCurrency'): string
   return null
 }
 
+function allJsonStrings(json: unknown[], keys: string[]): Array<{ value: string; source: string }> {
+  const results: Array<{ value: string; source: string }> = []
+  for (const root of json) {
+    walkJson(root, obj => {
+      for (const key of keys) {
+        const value = obj[key]
+        if (typeof value === 'string' && value.trim()) {
+          const decoded = value.replace(/&quot;/g, '"').replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim()
+          if (decoded && !results.some(r => r.value === decoded)) {
+            results.push({ value: decoded, source: `json_ld:${key}` })
+          }
+        }
+      }
+    })
+  }
+  return results
+}
+
+function allJsonOfferValues(json: unknown[], key: 'price' | 'priceCurrency'): Array<{ value: string; source: string }> {
+  const results: Array<{ value: string; source: string }> = []
+  for (const root of json) {
+    walkJson(root, obj => {
+      const offers = obj.offers
+      if (offers && typeof offers === 'object') {
+        const offerList = Array.isArray(offers) ? offers : [offers]
+        for (const offer of offerList) {
+          if (!offer || typeof offer !== 'object') continue
+          const value = (offer as Record<string, unknown>)[key]
+          if ((typeof value === 'string' || typeof value === 'number') && !results.some(r => r.value === String(value))) {
+            results.push({ value: String(value), source: `json_ld:offers.${key}` })
+          }
+        }
+      }
+      const value = obj[key]
+      if ((typeof value === 'string' || typeof value === 'number') && !results.some(r => r.value === String(value))) {
+        results.push({ value: String(value), source: `json_ld:${key}` })
+      }
+    })
+  }
+  return results
+}
+
+function allVisiblePrices(html: string): Array<{ value: string; source: string }> {
+  const text = html
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+  const results: Array<{ value: string; source: string }> = []
+  const re = /(?:MXN|M\.N\.|\ $)\s*[\d,.]+(?:\s*mil)?/gi
+  for (const match of text.matchAll(re)) {
+    const decoded = match[0].trim()
+    if (decoded && !results.some(r => r.value === decoded)) {
+      results.push({ value: decoded, source: 'visible_text' })
+    }
+  }
+  return results
+}
+
 function parsePrice(value: string | null): number | null {
   if (!value) return null
   const match = value.match(/(?:MXN|M\.N\.|\$)?\s*([\d.,]+(?:\s*mil)?)/i)
@@ -250,6 +320,39 @@ function parseHtmlListing(html: string, pageUrl: string, google: SerpOrganicResu
     ?? null
   const contactUrl = html.match(/https?:\/\/(?:wa\.me|api\.whatsapp\.com)\/[^"'\s<]+/i)?.[0] ?? null
 
+  const titleCandidates: FieldCandidate[] = [
+    ...allJsonStrings(json, ['name', 'headline']),
+    ...allMetaValues(meta, ['og:title', 'twitter:title']),
+  ]
+  const htmlTitle = titleTag(html)
+  if (htmlTitle) titleCandidates.push({ value: htmlTitle, source: 'html:title' })
+  if (google.title) titleCandidates.push({ value: google.title, source: 'google:title' })
+
+  const descCandidates: FieldCandidate[] = [
+    ...allJsonStrings(json, ['description']),
+    ...allMetaValues(meta, ['og:description', 'twitter:description', 'description']),
+  ]
+  if (google.snippet) descCandidates.push({ value: google.snippet, source: 'google:snippet' })
+
+  const priceCandidates: FieldCandidate[] = []
+  for (const c of allJsonOfferValues(json, 'price')) {
+    const cents = parsePrice(c.value)
+    if (cents) priceCandidates.push({ value: cents, source: c.source })
+  }
+  for (const c of allMetaValues(meta, ['product:price:amount', 'og:price:amount', 'price', 'twitter:data1'])) {
+    const cents = parsePrice(c.value)
+    if (cents) priceCandidates.push({ value: cents, source: c.source })
+  }
+  for (const c of allVisiblePrices(html)) {
+    const cents = parsePrice(c.value)
+    if (cents) priceCandidates.push({ value: cents, source: c.source })
+  }
+
+  const imageCandidates: FieldCandidate[] = images.map((url, i) => ({
+    value: url,
+    source: i < jsonImages(json).length ? 'json_ld:image' : 'meta:og:image',
+  }))
+
   const notes: string[] = []
   if (!priceCents) notes.push('price_not_found')
   if (images.length === 0) notes.push('image_not_found')
@@ -269,6 +372,12 @@ function parseHtmlListing(html: string, pageUrl: string, google: SerpOrganicResu
     contactUrl,
     attempts,
     notes,
+    candidates: {
+      title: titleCandidates,
+      description: descCandidates,
+      priceCents: priceCandidates,
+      imageUrl: imageCandidates,
+    },
   }
 }
 
@@ -407,6 +516,7 @@ export async function collectTargetedWebsiteSearch(params: TargetedSearchParams)
             contact_phone: parsed.contactPhone,
             contact_url: parsed.contactUrl,
             original_link_valid: isAllowedTarget(canonical, target.domains),
+            candidates: parsed.candidates,
           },
         }
         return withQuality(item, {

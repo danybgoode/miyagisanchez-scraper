@@ -3,6 +3,42 @@
 import { useState, useEffect, useCallback } from 'react'
 import { CATEGORIES, TARGET_SEARCH_SITES } from '@/lib/types'
 
+/* ── Types ───────────────────────────────────────────── */
+
+interface FieldCandidate {
+  value: string | number
+  source: string
+}
+
+interface RawDataWithCandidates extends Record<string, unknown> {
+  candidates?: {
+    title?: FieldCandidate[]
+    description?: FieldCandidate[]
+    priceCents?: FieldCandidate[]
+    imageUrl?: FieldCandidate[]
+  }
+}
+
+interface ScrapeItem {
+  source_platform: string
+  source_url: string | null
+  source_id?: string | null
+  shop_name: string | null
+  shop_source_url?: string | null
+  listing_title: string | null
+  listing_description?: string | null
+  price_cents?: number | null
+  currency?: string | null
+  condition?: string | null
+  listing_type: 'product' | 'service' | 'rental' | 'digital'
+  category?: string | null
+  state?: string | null
+  municipio?: string | null
+  location?: string | null
+  image_url?: string | null
+  raw_data?: RawDataWithCandidates
+}
+
 interface ScrapeRun {
   id: string
   source: string
@@ -27,6 +63,7 @@ interface RunResult {
   runId?: string
   sellerNickname?: string
   csvData?: string
+  items?: ScrapeItem[]
   stats?: {
     fetched: number
     parsed: number
@@ -41,6 +78,33 @@ interface RunResult {
   }
 }
 
+/* ── Editable row for validation ────────────────────── */
+
+interface EditableItem {
+  _idx: number
+  _included: boolean
+  source_url: string
+  title: string
+  description: string
+  price: string
+  shop_name: string
+  location: string
+  state: string
+  municipio: string
+  image_url: string
+  category: string
+  listing_type: string
+  condition: string
+  candidates: {
+    title: FieldCandidate[]
+    description: FieldCandidate[]
+    priceCents: FieldCandidate[]
+    imageUrl: FieldCandidate[]
+  }
+}
+
+/* ── Helpers ──────────────────────────────────────────── */
+
 function timeAgo(dateStr: string): string {
   const diff = Date.now() - new Date(dateStr).getTime()
   const mins = Math.floor(diff / 60000)
@@ -49,6 +113,77 @@ function timeAgo(dateStr: string): string {
   const hrs = Math.floor(mins / 60)
   if (hrs < 24) return `${hrs}h ago`
   return `${Math.floor(hrs / 24)}d ago`
+}
+
+function priceFromCents(cents: number | null | undefined): string {
+  if (cents === null || cents === undefined) return ''
+  return (cents / 100).toFixed(2)
+}
+
+function csvCell(value: unknown): string {
+  const text = value === null || value === undefined ? '' : String(value)
+  if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`
+  return text
+}
+
+function editableItemsToCsv(items: EditableItem[]): string {
+  const headers = ['source_url', 'title', 'description', 'price', 'shop_name', 'location', 'state', 'municipio', 'image_url', 'category', 'listing_type', 'condition']
+  const lines = [
+    headers.join(','),
+    ...items.filter(i => i._included).map(item => [
+      item.source_url,
+      item.title,
+      item.description,
+      item.price,
+      item.shop_name,
+      item.location,
+      item.state,
+      item.municipio,
+      item.image_url,
+      item.category,
+      item.listing_type,
+      item.condition,
+    ].map(csvCell).join(',')),
+  ]
+  return `${lines.join('\n')}\n`
+}
+
+function scrapeItemToEditable(item: ScrapeItem, idx: number): EditableItem {
+  const cands = item.raw_data?.candidates
+  return {
+    _idx: idx,
+    _included: true,
+    source_url: item.source_url ?? '',
+    title: item.listing_title ?? '',
+    description: item.listing_description ?? '',
+    price: priceFromCents(item.price_cents),
+    shop_name: item.shop_name ?? '',
+    location: item.location ?? '',
+    state: item.state ?? '',
+    municipio: item.municipio ?? '',
+    image_url: item.image_url ?? '',
+    category: item.category ?? '',
+    listing_type: item.listing_type ?? '',
+    condition: item.condition ?? '',
+    candidates: {
+      title: cands?.title ?? [],
+      description: cands?.description ?? [],
+      priceCents: cands?.priceCents ?? [],
+      imageUrl: cands?.imageUrl ?? [],
+    },
+  }
+}
+
+function downloadCsv(csvData: string, filename: string) {
+  const blob = new Blob([csvData], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -72,17 +207,313 @@ function sourceLabel(source: string): string {
   return 'ML Keyword'
 }
 
-function downloadCsv(csvData: string, filename: string) {
-  const blob = new Blob([csvData], { type: 'text/csv;charset=utf-8;' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  document.body.removeChild(a)
-  URL.revokeObjectURL(url)
+/* ── Candidate Picker Component ──────────────────────── */
+
+function CandidatePicker({
+  field,
+  currentValue,
+  candidates,
+  onSelect,
+  formatValue,
+}: {
+  field: string
+  currentValue: string
+  candidates: FieldCandidate[]
+  onSelect: (value: string) => void
+  formatValue?: (v: string | number) => string
+}) {
+  const [isOpen, setIsOpen] = useState(false)
+  const fmt = formatValue ?? ((v: string | number) => String(v))
+
+  if (candidates.length === 0) return null
+
+  return (
+    <div style={{ position: 'relative', display: 'inline-block' }}>
+      <button
+        type="button"
+        onClick={() => setIsOpen(!isOpen)}
+        style={{
+          background: 'none', border: 'none', cursor: 'pointer',
+          color: '#6366f1', fontSize: 11, fontWeight: 600,
+          padding: '2px 4px', borderRadius: 4,
+          display: 'flex', alignItems: 'center', gap: 3,
+        }}
+        title={`${candidates.length} candidate${candidates.length > 1 ? 's' : ''} for ${field}`}
+      >
+        <span style={{ fontSize: 13 }}>⬡</span>
+        {candidates.length}
+      </button>
+      {isOpen && (
+        <div style={{
+          position: 'absolute', top: '100%', left: 0, zIndex: 100,
+          backgroundColor: '#fff', border: '1px solid #e5e7eb',
+          borderRadius: 8, boxShadow: '0 8px 30px rgba(0,0,0,0.15)',
+          minWidth: 320, maxWidth: 450, maxHeight: 300, overflowY: 'auto',
+          padding: 6,
+        }}>
+          <div style={{ fontSize: 11, color: '#6b7280', padding: '4px 8px', fontWeight: 600, borderBottom: '1px solid #f3f4f6', marginBottom: 4 }}>
+            Candidates for {field}
+          </div>
+          {candidates.map((c, i) => {
+            const display = fmt(c.value)
+            const isSelected = display === currentValue || String(c.value) === currentValue
+            return (
+              <button
+                key={i}
+                type="button"
+                onClick={() => { onSelect(display); setIsOpen(false) }}
+                style={{
+                  display: 'block', width: '100%', textAlign: 'left',
+                  padding: '6px 8px', borderRadius: 4, fontSize: 12,
+                  border: 'none', cursor: 'pointer',
+                  backgroundColor: isSelected ? '#eef2ff' : 'transparent',
+                  color: '#111827',
+                  lineHeight: 1.4,
+                }}
+                onMouseEnter={e => { (e.target as HTMLButtonElement).style.backgroundColor = isSelected ? '#eef2ff' : '#f9fafb' }}
+                onMouseLeave={e => { (e.target as HTMLButtonElement).style.backgroundColor = isSelected ? '#eef2ff' : 'transparent' }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 8 }}>
+                  <span style={{
+                    overflow: 'hidden', textOverflow: 'ellipsis',
+                    display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+                    flex: 1, wordBreak: 'break-word',
+                  }}>
+                    {isSelected && <span style={{ color: '#4f46e5', marginRight: 4 }}>✓</span>}
+                    {display || <em style={{ color: '#9ca3af' }}>(empty)</em>}
+                  </span>
+                  <span style={{
+                    flexShrink: 0, fontSize: 10, fontWeight: 600,
+                    backgroundColor: '#f3f4f6', color: '#6b7280',
+                    padding: '1px 6px', borderRadius: 10,
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {c.source}
+                  </span>
+                </div>
+              </button>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
 }
+
+/* ── Validation Table Component ──────────────────────── */
+
+function ValidationTable({
+  items,
+  onUpdate,
+  onExport,
+  onCancel,
+  sourceName,
+}: {
+  items: EditableItem[]
+  onUpdate: (idx: number, field: keyof EditableItem, value: string | boolean) => void
+  onExport: () => void
+  onCancel: () => void
+  sourceName: string
+}) {
+  const [expandedRow, setExpandedRow] = useState<number | null>(null)
+  const includedCount = items.filter(i => i._included).length
+
+  const editableFields: Array<{ key: keyof EditableItem; label: string; candidateKey?: keyof EditableItem['candidates'] }> = [
+    { key: 'title', label: 'Title', candidateKey: 'title' },
+    { key: 'description', label: 'Description', candidateKey: 'description' },
+    { key: 'price', label: 'Price', candidateKey: 'priceCents' },
+    { key: 'image_url', label: 'Image', candidateKey: 'imageUrl' },
+    { key: 'shop_name', label: 'Shop' },
+    { key: 'location', label: 'Location' },
+    { key: 'state', label: 'State' },
+    { key: 'category', label: 'Category' },
+  ]
+
+  const cellInput: React.CSSProperties = {
+    width: '100%', padding: '4px 6px', border: '1px solid #e5e7eb',
+    borderRadius: 4, fontSize: 12, boxSizing: 'border-box',
+    backgroundColor: '#fff', fontFamily: 'inherit',
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, zIndex: 1000,
+      backgroundColor: 'rgba(0,0,0,0.5)',
+      display: 'flex', flexDirection: 'column',
+    }}>
+      <div style={{
+        backgroundColor: '#fff', flex: 1,
+        display: 'flex', flexDirection: 'column',
+        margin: '20px', borderRadius: 12,
+        boxShadow: '0 25px 50px rgba(0,0,0,0.25)',
+        overflow: 'hidden',
+      }}>
+        {/* Header */}
+        <div style={{
+          padding: '16px 24px', borderBottom: '1px solid #e5e7eb',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          background: 'linear-gradient(to right, #f8fafc, #eef2ff)',
+        }}>
+          <div>
+            <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: '#111827' }}>
+              📋 Validate Scraped Data
+            </h2>
+            <p style={{ margin: '4px 0 0', fontSize: 13, color: '#6b7280' }}>
+              {includedCount} of {items.length} items included · {sourceName}
+              {' · '}Click <span style={{ color: '#6366f1', fontWeight: 600 }}>⬡</span> to see alternative candidates from different parsers
+            </p>
+          </div>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button onClick={onCancel} style={{
+              padding: '8px 18px', borderRadius: 6, border: '1px solid #d1d5db',
+              backgroundColor: '#fff', color: '#374151', fontSize: 13,
+              fontWeight: 600, cursor: 'pointer',
+            }}>Cancel</button>
+            <button onClick={onExport} style={{
+              padding: '8px 22px', borderRadius: 6, border: 'none',
+              background: 'linear-gradient(135deg, #4f46e5, #6366f1)',
+              color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+              boxShadow: '0 2px 8px rgba(99,102,241,0.35)',
+            }}>
+              ✦ Export CSV ({includedCount} rows)
+            </button>
+          </div>
+        </div>
+
+        {/* Table body */}
+        <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px' }}>
+          {items.map((item, idx) => {
+            const isExpanded = expandedRow === idx
+            const hasAnyCandidates = Object.values(item.candidates).some(c => c.length > 0)
+
+            return (
+              <div
+                key={idx}
+                style={{
+                  margin: '8px 0',
+                  border: `1px solid ${item._included ? '#e5e7eb' : '#fecaca'}`,
+                  borderRadius: 8,
+                  backgroundColor: item._included ? '#fff' : '#fef2f2',
+                  opacity: item._included ? 1 : 0.6,
+                  transition: 'all 0.15s ease',
+                }}
+              >
+                {/* Row summary bar */}
+                <div
+                  style={{
+                    padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10,
+                    cursor: 'pointer', userSelect: 'none',
+                    borderBottom: isExpanded ? '1px solid #f3f4f6' : 'none',
+                  }}
+                  onClick={() => setExpandedRow(isExpanded ? null : idx)}
+                >
+                  <input
+                    type="checkbox"
+                    checked={item._included}
+                    onChange={e => { e.stopPropagation(); onUpdate(idx, '_included', e.target.checked) }}
+                    onClick={e => e.stopPropagation()}
+                    style={{ width: 16, height: 16, accentColor: '#4f46e5', cursor: 'pointer' }}
+                  />
+                  <span style={{ fontSize: 13, fontWeight: 600, color: '#111827', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {item.title || <em style={{ color: '#9ca3af' }}>No title</em>}
+                  </span>
+                  {item.price && (
+                    <span style={{ fontSize: 12, fontWeight: 700, color: '#059669', backgroundColor: '#ecfdf5', padding: '2px 8px', borderRadius: 10 }}>
+                      ${item.price}
+                    </span>
+                  )}
+                  {!item.price && (
+                    <span style={{ fontSize: 11, color: '#dc2626', backgroundColor: '#fef2f2', padding: '2px 6px', borderRadius: 10 }}>no price</span>
+                  )}
+                  {item.image_url && (
+                    <span style={{ fontSize: 11, color: '#059669' }}>📷</span>
+                  )}
+                  {!item.image_url && (
+                    <span style={{ fontSize: 11, color: '#dc2626' }}>no img</span>
+                  )}
+                  {hasAnyCandidates && (
+                    <span style={{ fontSize: 10, color: '#6366f1', backgroundColor: '#eef2ff', padding: '2px 6px', borderRadius: 10, fontWeight: 600 }}>
+                      has candidates
+                    </span>
+                  )}
+                  <span style={{ fontSize: 18, color: '#9ca3af', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>▾</span>
+                </div>
+
+                {/* Expanded editor */}
+                {isExpanded && (
+                  <div style={{ padding: '12px 14px' }}>
+                    {/* Source URL (read only) */}
+                    <div style={{ marginBottom: 10 }}>
+                      <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 2 }}>Source URL</div>
+                      <a href={item.source_url} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12, color: '#2563eb', wordBreak: 'break-all' }}>
+                        {item.source_url}
+                      </a>
+                    </div>
+
+                    {/* Image preview */}
+                    {item.image_url && (
+                      <div style={{ marginBottom: 10 }}>
+                        <img
+                          src={item.image_url}
+                          alt="preview"
+                          style={{ maxWidth: 180, maxHeight: 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover' }}
+                          onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
+                        />
+                      </div>
+                    )}
+
+                    {/* Editable fields grid */}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px' }}>
+                      {editableFields.map(({ key, label, candidateKey }) => {
+                        const candidates = candidateKey ? item.candidates[candidateKey] : []
+                        const value = String(item[key] ?? '')
+                        const isLongField = key === 'description'
+
+                        return (
+                          <div key={key} style={isLongField ? { gridColumn: '1 / -1' } : {}}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
+                              <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280' }}>{label}</span>
+                              {candidates.length > 0 && (
+                                <CandidatePicker
+                                  field={label}
+                                  currentValue={value}
+                                  candidates={candidates}
+                                  onSelect={v => onUpdate(idx, key, v)}
+                                  formatValue={candidateKey === 'priceCents' ? (v) => (Number(v) / 100).toFixed(2) : undefined}
+                                />
+                              )}
+                            </div>
+                            {isLongField ? (
+                              <textarea
+                                value={value}
+                                onChange={e => onUpdate(idx, key, e.target.value)}
+                                rows={3}
+                                style={{ ...cellInput, resize: 'vertical' }}
+                              />
+                            ) : (
+                              <input
+                                type="text"
+                                value={value}
+                                onChange={e => onUpdate(idx, key, e.target.value)}
+                                style={cellInput}
+                              />
+                            )}
+                          </div>
+                        )
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/* ── Result Banner ───────────────────────────────────── */
 
 function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: RunResult | null; loading: boolean; secret: string; sourceLabelStr: string }) {
   if (loading) return (
@@ -107,7 +538,7 @@ function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: Run
             <span style={{ color: '#475569' }}>Auto-skipped <strong>{result.stats?.autoSkipped ?? result.skipped ?? 0}</strong></span>
             {(result.errors ?? 0) > 0 && <span style={{ color: '#dc2626' }}>Errors <strong>{result.errors}</strong></span>}
             {result.csvData && (
-              <button 
+              <button
                 onClick={() => downloadCsv(result.csvData!, `scrape_${sourceLabelStr}_${Date.now()}.csv`)}
                 style={{ color: '#166534', fontWeight: 600, background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontSize: 14 }}
               >
@@ -139,6 +570,8 @@ function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: Run
   )
 }
 
+/* ── Form State Interfaces ───────────────────────────── */
+
 interface SerpApiFormState {
   query: string
   location: string
@@ -169,10 +602,17 @@ interface TargetedFormState {
   limit: string
 }
 
+/* ── Main Component ──────────────────────────────────── */
+
 export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [apiKey, setApiKey] = useState('')
+  const [validationMode, setValidationMode] = useState(true)
   const [runs, setRuns] = useState<ScrapeRun[]>([])
-  
+
+  // Validation state
+  const [validatingItems, setValidatingItems] = useState<EditableItem[] | null>(null)
+  const [validationSource, setValidationSource] = useState('')
+
   const [serpForm, setSerpForm] = useState<SerpApiFormState>({
     query: '',
     location: 'Ciudad de México, Mexico',
@@ -212,11 +652,18 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   useEffect(() => {
     const savedKey = localStorage.getItem('miyagi_serpapi_key')
     if (savedKey) setApiKey(savedKey)
+    const savedMode = localStorage.getItem('miyagi_validation_mode')
+    if (savedMode !== null) setValidationMode(savedMode === 'true')
   }, [])
 
   const handleApiKeyChange = (val: string) => {
     setApiKey(val)
     localStorage.setItem('miyagi_serpapi_key', val)
+  }
+
+  const handleValidationToggle = (val: boolean) => {
+    setValidationMode(val)
+    localStorage.setItem('miyagi_validation_mode', String(val))
   }
 
   const getLocalRuns = useCallback((): ScrapeRun[] => {
@@ -232,30 +679,26 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   const saveLocalRun = useCallback((run: ScrapeRun) => {
     const runs = getLocalRuns()
     runs.unshift(run)
-    if (runs.length > 20) runs.length = 20 // Keep last 20 runs
+    if (runs.length > 20) runs.length = 20
     localStorage.setItem('miyagi_local_runs', JSON.stringify(runs))
   }, [getLocalRuns])
 
   const fetchRuns = useCallback(async () => {
     let serverRuns: ScrapeRun[] = []
-    let isLocalOnly = false
     try {
       const res = await fetch(`/api/admin/runs?secret=${encodeURIComponent(secret)}`)
       if (res.ok) {
         const json = await res.json() as { runs: ScrapeRun[], isLocalOnly?: boolean }
         serverRuns = json.runs || []
-        isLocalOnly = !!json.isLocalOnly
       }
     } catch (e) {
       console.error(e)
     }
 
     const localRuns = getLocalRuns()
-    // Merge, local runs take precedence if IDs match, and order by started_at desc
     const merged = [...localRuns, ...serverRuns]
     const unique = Array.from(new Map(merged.map(r => [r.id, r])).values())
     unique.sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime())
-    
     setRuns(unique)
   }, [secret, getLocalRuns])
 
@@ -264,31 +707,77 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     return () => window.clearTimeout(timer)
   }, [fetchRuns])
 
-  async function handleScrapeResponse(res: Response, source: string, params: any) {
-    const json = await res.json() as RunResult
-    if (res.ok) {
-      if (json.csvData) {
-        // Automatically download CSV if returned
-        downloadCsv(json.csvData, `scrape_${source}_${Date.now()}.csv`)
-        // Save to local runs
-        saveLocalRun({
-          id: json.runId || `local-${Date.now()}`,
-          source,
-          params,
-          status: 'completed',
-          count_inserted: json.inserted || json.collected || 0,
-          count_skipped: json.skipped || 0,
-          count_errors: json.errors || 0,
-          error_message: null,
-          started_at: new Date().toISOString(),
-          completed_at: new Date().toISOString(),
-          csvData: json.csvData,
-          isLocal: true,
-        })
-      }
+  /* Handle scrape response – either open validation or auto-download */
+  function handleScrapeResult(json: RunResult, source: string, params: Record<string, unknown>) {
+    if (json.error) return
+
+    // If validation mode is ON and we have items, open the validation UI
+    if (validationMode && json.items && json.items.length > 0) {
+      const editables = json.items.map((item, i) => scrapeItemToEditable(item, i))
+      setValidatingItems(editables)
+      setValidationSource(source)
+      return
     }
-    return json
+
+    // Otherwise auto-download CSV (legacy behavior)
+    if (json.csvData) {
+      downloadCsv(json.csvData, `scrape_${source}_${Date.now()}.csv`)
+      saveLocalRun({
+        id: json.runId || `local-${Date.now()}`,
+        source,
+        params,
+        status: 'completed',
+        count_inserted: json.inserted || json.collected || 0,
+        count_skipped: json.skipped || 0,
+        count_errors: json.errors || 0,
+        error_message: null,
+        started_at: new Date().toISOString(),
+        completed_at: new Date().toISOString(),
+        csvData: json.csvData,
+        isLocal: true,
+      })
+    }
   }
+
+  function handleValidationUpdate(idx: number, field: keyof EditableItem, value: string | boolean) {
+    setValidatingItems(prev => {
+      if (!prev) return prev
+      const updated = [...prev]
+      const item = { ...updated[idx] }
+      if (field === '_included') {
+        item._included = value as boolean
+      } else {
+        (item as Record<string, unknown>)[field] = value as string
+      }
+      updated[idx] = item
+      return updated
+    })
+  }
+
+  function handleValidationExport() {
+    if (!validatingItems) return
+    const csv = editableItemsToCsv(validatingItems)
+    downloadCsv(csv, `scrape_${validationSource}_${Date.now()}.csv`)
+    const included = validatingItems.filter(i => i._included).length
+    saveLocalRun({
+      id: `local-${Date.now()}`,
+      source: validationSource,
+      params: {},
+      status: 'completed',
+      count_inserted: included,
+      count_skipped: validatingItems.length - included,
+      count_errors: 0,
+      error_message: null,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+      csvData: csv,
+      isLocal: true,
+    })
+    setValidatingItems(null)
+    void fetchRuns()
+  }
+
+  /* ── Scrape handlers ─────────────────────────────── */
 
   async function runSerpApi(e: React.FormEvent) {
     e.preventDefault()
@@ -305,15 +794,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
-        body: JSON.stringify({
-          source: 'serpapi_google_local',
-          mode: 'collect_only',
-          params,
-          apiKey,
-        }),
+        body: JSON.stringify({ source: 'serpapi_google_local', mode: 'collect_only', params, apiKey }),
       })
-      const json = await handleScrapeResponse(res, 'serpapi_google_local', params)
+      const json = await res.json() as RunResult
       setSerpResult(json)
+      handleScrapeResult(json, 'serpapi_google_local', params)
       await fetchRuns()
     } catch (err) {
       setSerpResult({ error: String(err) })
@@ -336,15 +821,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
-        body: JSON.stringify({
-          source: 'mercadolibre_public',
-          mode: 'collect_only',
-          params,
-          apiKey,
-        }),
+        body: JSON.stringify({ source: 'mercadolibre_public', mode: 'collect_only', params, apiKey }),
       })
-      const json = await handleScrapeResponse(res, 'mercadolibre_public', params)
+      const json = await res.json() as RunResult
       setMlResult(json)
+      handleScrapeResult(json, 'mercadolibre_public', params)
       await fetchRuns()
     } catch (err) {
       setMlResult({ error: String(err) })
@@ -366,15 +847,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
-        body: JSON.stringify({
-          source: 'mercadolibre_seller',
-          mode: 'collect_only',
-          params,
-          apiKey,
-        }),
+        body: JSON.stringify({ source: 'mercadolibre_seller', mode: 'collect_only', params, apiKey }),
       })
-      const json = await handleScrapeResponse(res, 'mercadolibre_seller', params)
+      const json = await res.json() as RunResult
       setMlSellerResult(json)
+      handleScrapeResult(json, 'mercadolibre_seller', params)
       await fetchRuns()
     } catch (err) {
       setMlSellerResult({ error: String(err) })
@@ -399,15 +876,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
-        body: JSON.stringify({
-          source: 'targeted_website_search',
-          mode: 'collect_only',
-          params,
-          apiKey,
-        }),
+        body: JSON.stringify({ source: 'targeted_website_search', mode: 'collect_only', params, apiKey }),
       })
-      const json = await handleScrapeResponse(res, 'targeted_website_search', params)
+      const json = await res.json() as RunResult
       setTargetedResult(json)
+      handleScrapeResult(json, 'targeted_website_search', params)
       await fetchRuns()
     } catch (err) {
       setTargetedResult({ error: String(err) })
@@ -415,6 +888,8 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       setTargetedLoading(false)
     }
   }
+
+  /* ── Styles ──────────────────────────────────────── */
 
   const input: React.CSSProperties = {
     width: '100%', padding: '8px 10px',
@@ -450,6 +925,17 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+      {/* Validation overlay */}
+      {validatingItems && (
+        <ValidationTable
+          items={validatingItems}
+          onUpdate={handleValidationUpdate}
+          onExport={handleValidationExport}
+          onCancel={() => setValidatingItems(null)}
+          sourceName={sourceLabel(validationSource)}
+        />
+      )}
+
       {/* Nav */}
       <div style={{ backgroundColor: '#111827', color: '#fff', padding: '14px 28px', display: 'flex', alignItems: 'center', gap: 12, borderBottom: '1px solid #1f2937' }}>
         <span style={{ fontWeight: 800, fontSize: 18, letterSpacing: '-0.5px' }}>miyagisanchez</span>
@@ -462,17 +948,59 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         {/* Global Settings */}
         <div style={card}>
           <h2 style={sectionTitle}>⚙️ Local Settings</h2>
-          <p style={sectionSub}>Configure your local API keys for database-less execution.</p>
-          <div style={field}>
-            <label style={label}>SerpAPI Key</label>
-            <input 
-              style={input} 
-              type="password"
-              value={apiKey} 
-              onChange={e => handleApiKeyChange(e.target.value)} 
-              placeholder="Paste your SerpAPI key here (saved locally)" 
-            />
-            <p style={hint}>Required for Google Local and Targeted Website Search.</p>
+          <p style={sectionSub}>Configure your local API keys and export mode.</p>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div style={field}>
+              <label style={label}>SerpAPI Key</label>
+              <input
+                style={input}
+                type="password"
+                value={apiKey}
+                onChange={e => handleApiKeyChange(e.target.value)}
+                placeholder="Paste your SerpAPI key here (saved locally)"
+              />
+              <p style={hint}>Required for Google Local and Targeted Website Search.</p>
+            </div>
+            <div style={field}>
+              <label style={label}>Export Mode</label>
+              <div style={{
+                display: 'flex', borderRadius: 8, border: '1px solid #d1d5db',
+                overflow: 'hidden', marginTop: 2,
+              }}>
+                <button
+                  type="button"
+                  onClick={() => handleValidationToggle(true)}
+                  style={{
+                    flex: 1, padding: '8px 12px', border: 'none', cursor: 'pointer',
+                    fontSize: 13, fontWeight: 600,
+                    backgroundColor: validationMode ? '#4f46e5' : '#fff',
+                    color: validationMode ? '#fff' : '#6b7280',
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  📋 Validation Mode
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleValidationToggle(false)}
+                  style={{
+                    flex: 1, padding: '8px 12px', border: 'none', cursor: 'pointer',
+                    fontSize: 13, fontWeight: 600,
+                    backgroundColor: !validationMode ? '#4f46e5' : '#fff',
+                    color: !validationMode ? '#fff' : '#6b7280',
+                    borderLeft: '1px solid #d1d5db',
+                    transition: 'all 0.15s',
+                  }}
+                >
+                  ⚡ Quick CSV
+                </button>
+              </div>
+              <p style={hint}>
+                {validationMode
+                  ? 'Review & pick candidates before CSV export.'
+                  : 'Auto-download CSV immediately after scrape.'}
+              </p>
+            </div>
           </div>
         </div>
 
