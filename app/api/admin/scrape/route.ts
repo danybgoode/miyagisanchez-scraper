@@ -3,6 +3,7 @@ import { db } from '@/lib/supabase'
 import { collectSerpApiLocal, scrapeSerpApiLocal } from '@/lib/scrapers/serpapi'
 import { collectMLSeller, scrapeMercadoLibre, scrapeMLSeller } from '@/lib/scrapers/mercadolibre'
 import { collectTargetedWebsiteSearch } from '@/lib/scrapers/targeted'
+import { collectApifyTargetedSearch } from '@/lib/scrapers/apify'
 import { saveScrapeRunItems, scrapeItemsToCsv, type ScrapeCollectResult } from '@/lib/adminScrapeExport'
 import type { TargetSearchSiteKey } from '@/lib/types'
 
@@ -21,12 +22,13 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json() as {
-    source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller' | 'targeted_website_search'
+    source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller' | 'targeted_website_search' | 'targeted_apify_actor'
     mode?: 'collect_only' | 'direct_import'
-    params: Record<string, string | number>
+    params: Record<string, unknown>
     apiKey?: string
+    apifyApiKey?: string
   }
-  const { source, params, apiKey } = body
+  const { source, params, apiKey, apifyApiKey } = body
   const mode = body.mode ?? 'collect_only'
 
   const hasDb = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
@@ -114,6 +116,29 @@ export async function POST(req: NextRequest) {
         location: params.location ? String(params.location) : undefined,
         limit: Number(params.limit ?? 20),
         apiKey,
+      })
+    } else if (source === 'targeted_apify_actor') {
+      result = await collectApifyTargetedSearch({
+        query: params.query ? String(params.query) : undefined,
+        targetSite: String(params.targetSite ?? 'mercadolibre') as TargetSearchSiteKey,
+        category: params.category ? String(params.category) : undefined,
+        state: params.state ? String(params.state) : undefined,
+        location: params.location ? String(params.location) : undefined,
+        limit: Number(params.limit ?? 20),
+        apiKey: apifyApiKey,
+        apifyMode: params.apifyMode === 'urls' ? 'urls' : 'filters',
+        urls: params.urls ? String(params.urls) : undefined,
+        ignoreUrlFailures: params.ignoreUrlFailures !== false,
+        propertyType: params.propertyType ? String(params.propertyType) : undefined,
+        operationType: params.operationType ? String(params.operationType) : undefined,
+        publishedDate: params.publishedDate ? String(params.publishedDate) : undefined,
+        sortBy: params.sortBy ? String(params.sortBy) : undefined,
+        page: params.page ? Number(params.page) : undefined,
+        maxRetries: params.maxRetries ? Number(params.maxRetries) : undefined,
+        searchCategory: params.searchCategory ? String(params.searchCategory) : undefined,
+        domainCode: params.domainCode ? String(params.domainCode) : undefined,
+        fastMode: params.fastMode !== false,
+        vehicleYear: params.vehicleYear ? Number(params.vehicleYear) : undefined,
       })
     } else if (source === 'mercadolibre_public') {
       throw new Error('ML keyword search remains blocked for Mexico. Use Seller Targeting or the new /supply CSV workflow.')

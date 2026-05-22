@@ -8,6 +8,7 @@ Required env vars:
 
 - `ADMIN_SECRET`
 - `SERPAPI_KEY`
+- `APIFY_TOKEN`
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 

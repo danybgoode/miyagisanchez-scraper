@@ -204,8 +204,57 @@ function sourceLabel(source: string): string {
   if (source === 'serpapi_google_local') return 'Google Local'
   if (source === 'mercadolibre_seller') return 'ML Seller'
   if (source === 'targeted_website_search') return 'Targeted Search'
+  if (source === 'targeted_apify_actor') return 'Apify Targeted'
   return 'ML Keyword'
 }
+
+type TargetedSource = 'serpapi' | 'apify'
+
+const APIFY_SITE_KEYS = new Set(['inmuebles24', 'mercadolibre'])
+
+const INMUEBLES_PROPERTY_TYPES = [
+  { value: '', label: 'Any' },
+  { value: 'Departamento', label: 'Departamento' },
+  { value: 'Casa', label: 'Casa' },
+  { value: 'Terreno', label: 'Terreno' },
+  { value: 'Oficina comercial', label: 'Oficina comercial' },
+  { value: 'Local comercial', label: 'Local comercial' },
+  { value: 'Bodega comercial', label: 'Bodega comercial' },
+  { value: 'Quinta Vacacional', label: 'Quinta vacacional' },
+]
+
+const INMUEBLES_OPERATION_TYPES = [
+  { value: '', label: 'Any' },
+  { value: 'Venta', label: 'Venta' },
+  { value: 'Renta', label: 'Renta' },
+  { value: 'Renta temporal', label: 'Renta temporal' },
+]
+
+const INMUEBLES_PUBLISHED_DATES = [
+  { value: '', label: 'Any' },
+  { value: 'Hoy', label: 'Hoy' },
+  { value: 'Ayer', label: 'Ayer' },
+  { value: 'Última semana', label: 'Última semana' },
+  { value: 'Últimos 15 días', label: 'Últimos 15 días' },
+  { value: 'Último mes', label: 'Último mes' },
+]
+
+const APIFY_SORT_OPTIONS = [
+  { value: '', label: 'Relevance' },
+  { value: 'relevance', label: 'Relevance' },
+  { value: 'price_asc', label: 'Price low to high' },
+  { value: 'price_desc', label: 'Price high to low' },
+  { value: 'newest', label: 'Newest' },
+]
+
+const ML_SEARCH_CATEGORIES = [
+  { value: 'all', label: 'All categories' },
+  { value: 'vehicles', label: 'Vehicles' },
+  { value: 'real_estate', label: 'Real estate' },
+  { value: 'services', label: 'Services' },
+  { value: 'electronics', label: 'Electronics' },
+  { value: 'home', label: 'Home' },
+]
 
 /* ── Candidate Picker Component ──────────────────────── */
 
@@ -594,18 +643,33 @@ interface MLSellerFormState {
 }
 
 interface TargetedFormState {
+  source: TargetedSource
   query: string
   targetSite: string
   category: string
   location: string
   state: string
   limit: string
+  apifyMode: 'urls' | 'filters'
+  urls: string
+  ignoreUrlFailures: boolean
+  propertyType: string
+  operationType: string
+  publishedDate: string
+  sortBy: string
+  page: string
+  maxRetries: string
+  searchCategory: string
+  domainCode: string
+  fastMode: boolean
+  vehicleYear: string
 }
 
 /* ── Main Component ──────────────────────────────────── */
 
 export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [apiKey, setApiKey] = useState('')
+  const [apifyApiKey, setApifyApiKey] = useState('')
   const [validationMode, setValidationMode] = useState(true)
   const [runs, setRuns] = useState<ScrapeRun[]>([])
 
@@ -632,12 +696,26 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     limit: '50',
   })
   const [targetedForm, setTargetedForm] = useState<TargetedFormState>({
+    source: 'serpapi',
     query: '',
     targetSite: 'mercadolibre',
     category: 'autos',
     location: 'Ciudad de México, Mexico',
     state: 'Ciudad de México',
     limit: '20',
+    apifyMode: 'filters',
+    urls: '',
+    ignoreUrlFailures: true,
+    propertyType: '',
+    operationType: '',
+    publishedDate: '',
+    sortBy: '',
+    page: '1',
+    maxRetries: '2',
+    searchCategory: 'all',
+    domainCode: 'MX',
+    fastMode: true,
+    vehicleYear: '',
   })
 
   const [serpLoading, setSerpLoading] = useState(false)
@@ -650,15 +728,25 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [targetedResult, setTargetedResult] = useState<RunResult | null>(null)
 
   useEffect(() => {
-    const savedKey = localStorage.getItem('miyagi_serpapi_key')
-    if (savedKey) setApiKey(savedKey)
-    const savedMode = localStorage.getItem('miyagi_validation_mode')
-    if (savedMode !== null) setValidationMode(savedMode === 'true')
+    const timer = window.setTimeout(() => {
+      const savedKey = localStorage.getItem('miyagi_serpapi_key')
+      if (savedKey) setApiKey(savedKey)
+      const savedApifyKey = localStorage.getItem('miyagi_apify_key')
+      if (savedApifyKey) setApifyApiKey(savedApifyKey)
+      const savedMode = localStorage.getItem('miyagi_validation_mode')
+      if (savedMode !== null) setValidationMode(savedMode === 'true')
+    }, 0)
+    return () => window.clearTimeout(timer)
   }, [])
 
   const handleApiKeyChange = (val: string) => {
     setApiKey(val)
     localStorage.setItem('miyagi_serpapi_key', val)
+  }
+
+  const handleApifyApiKeyChange = (val: string) => {
+    setApifyApiKey(val)
+    localStorage.setItem('miyagi_apify_key', val)
   }
 
   const handleValidationToggle = (val: boolean) => {
@@ -864,7 +952,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     e.preventDefault()
     setTargetedLoading(true)
     setTargetedResult(null)
-    const params = {
+    const params: Record<string, string | number | boolean> = {
       query: targetedForm.query,
       targetSite: targetedForm.targetSite,
       category: targetedForm.category,
@@ -872,15 +960,39 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       state: targetedForm.state,
       limit: Number(targetedForm.limit),
     }
+    if (targetedForm.source === 'apify') {
+      Object.assign(params, {
+        apifyMode: targetedForm.apifyMode,
+        urls: targetedForm.urls,
+        ignoreUrlFailures: targetedForm.ignoreUrlFailures,
+        propertyType: targetedForm.propertyType,
+        operationType: targetedForm.operationType,
+        publishedDate: targetedForm.publishedDate,
+        sortBy: targetedForm.sortBy,
+        page: Number(targetedForm.page || 1),
+        maxRetries: Number(targetedForm.maxRetries || 2),
+        searchCategory: targetedForm.searchCategory,
+        domainCode: targetedForm.domainCode,
+        fastMode: targetedForm.fastMode,
+        ...(targetedForm.vehicleYear ? { vehicleYear: Number(targetedForm.vehicleYear) } : {}),
+      })
+    }
+    const source = targetedForm.source === 'apify' ? 'targeted_apify_actor' : 'targeted_website_search'
     try {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
-        body: JSON.stringify({ source: 'targeted_website_search', mode: 'collect_only', params, apiKey }),
+        body: JSON.stringify({
+          source,
+          mode: 'collect_only',
+          params,
+          apiKey,
+          apifyApiKey,
+        }),
       })
       const json = await res.json() as RunResult
       setTargetedResult(json)
-      handleScrapeResult(json, 'targeted_website_search', params)
+      handleScrapeResult(json, source, params)
       await fetchRuns()
     } catch (err) {
       setTargetedResult({ error: String(err) })
@@ -949,7 +1061,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         <div style={card}>
           <h2 style={sectionTitle}>⚙️ Local Settings</h2>
           <p style={sectionSub}>Configure your local API keys and export mode.</p>
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 }}>
             <div style={field}>
               <label style={label}>SerpAPI Key</label>
               <input
@@ -960,6 +1072,17 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                 placeholder="Paste your SerpAPI key here (saved locally)"
               />
               <p style={hint}>Required for Google Local and Targeted Website Search.</p>
+            </div>
+            <div style={field}>
+              <label style={label}>Apify API Token</label>
+              <input
+                style={input}
+                type="password"
+                value={apifyApiKey}
+                onChange={e => handleApifyApiKeyChange(e.target.value)}
+                placeholder="Paste your Apify token here (saved locally)"
+              />
+              <p style={hint}>Required for Apify-powered Inmuebles24 and MercadoLibre.</p>
             </div>
             <div style={field}>
               <label style={label}>Export Mode</label>
@@ -1049,10 +1172,34 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
             <span style={{ backgroundColor: '#eff6ff', color: '#1d4ed8', fontSize: 12, fontWeight: 600, padding: '2px 8px', borderRadius: 20, border: '1px solid #bfdbfe' }}>Quality gate disabled</span>
           </div>
           <p style={sectionSub}>
-            Search one marketplace at a time through Google, fetch each result, parse listing fields, and show quality diagnostics in the CSV.
+            Choose the website and collection source first. The fields below only show inputs that the selected source can actually support.
           </p>
           <form onSubmit={(e) => { void runTargeted(e) }}>
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+              <div style={field}>
+                <label style={label}>Source</label>
+                <select
+                  style={input}
+                  value={targetedForm.source}
+                  onChange={e => {
+                    const source = e.target.value as TargetedSource
+                    setTargetedForm(f => {
+                      const nextSite = source === 'apify' && !APIFY_SITE_KEYS.has(f.targetSite) ? 'inmuebles24' : f.targetSite
+                      const site = TARGET_SEARCH_SITES.find(item => item.key === nextSite)
+                      return {
+                        ...f,
+                        source,
+                        targetSite: nextSite,
+                        category: site?.defaultCategory ?? f.category,
+                      }
+                    })
+                  }}
+                >
+                  <option value="serpapi">SerpAPI Google</option>
+                  <option value="apify">Apify Actor</option>
+                </select>
+                <p style={hint}>{targetedForm.source === 'apify' ? 'Site-specific actor fields.' : 'Google query with site: filtering.'}</p>
+              </div>
               <div style={field}>
                 <label style={label}>Website</label>
                 <select
@@ -1067,38 +1214,195 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                     }))
                   }}
                 >
-                  {TARGET_SEARCH_SITES.map(site => <option key={site.key} value={site.key}>{site.label}</option>)}
+                  {TARGET_SEARCH_SITES
+                    .filter(site => targetedForm.source === 'serpapi' || APIFY_SITE_KEYS.has(site.key))
+                    .map(site => <option key={site.key} value={site.key}>{site.label}</option>)}
                 </select>
-                <p style={hint}>{TARGET_SEARCH_SITES.find(site => site.key === targetedForm.targetSite)?.queryPrefix}</p>
+                <p style={hint}>
+                  {targetedForm.source === 'apify'
+                    ? targetedForm.targetSite === 'inmuebles24' ? 'Actor: Inmuebles24 Property Listings Scraper' : 'Actor: Mercado Libre Scraper'
+                    : TARGET_SEARCH_SITES.find(site => site.key === targetedForm.targetSite)?.queryPrefix}
+                </p>
               </div>
-              <div style={field}>
-                <label style={label}>Query</label>
-                <input style={input} value={targetedForm.query} onChange={e => setTargetedForm(f => ({ ...f, query: e.target.value }))} placeholder="honda civic cdmx, departamento roma..." required />
-              </div>
-              <div style={field}>
-                <label style={label}>Category</label>
-                <select style={input} value={targetedForm.category} onChange={e => setTargetedForm(f => ({ ...f, category: e.target.value }))}>
-                  {CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
-                </select>
-              </div>
-              <div style={field}>
-                <label style={label}>Limit</label>
-                <input style={input} type="number" min={1} max={50} value={targetedForm.limit} onChange={e => setTargetedForm(f => ({ ...f, limit: e.target.value }))} />
-              </div>
-              <div style={field}>
-                <label style={label}>Location</label>
-                <input style={input} value={targetedForm.location} onChange={e => setTargetedForm(f => ({ ...f, location: e.target.value }))} placeholder="Ciudad de México, Mexico" />
-              </div>
-              <div style={field}>
-                <label style={label}>State (DB field)</label>
-                <input style={input} value={targetedForm.state} onChange={e => setTargetedForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
-              </div>
+
+              {targetedForm.source === 'serpapi' && (
+                <>
+                  <div style={field}>
+                    <label style={label}>Query</label>
+                    <input style={input} value={targetedForm.query} onChange={e => setTargetedForm(f => ({ ...f, query: e.target.value }))} placeholder="honda civic cdmx, departamento roma..." required />
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Category</label>
+                    <select style={input} value={targetedForm.category} onChange={e => setTargetedForm(f => ({ ...f, category: e.target.value }))}>
+                      {CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                    </select>
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Limit</label>
+                    <input style={input} type="number" min={1} max={50} value={targetedForm.limit} onChange={e => setTargetedForm(f => ({ ...f, limit: e.target.value }))} />
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Location</label>
+                    <input style={input} value={targetedForm.location} onChange={e => setTargetedForm(f => ({ ...f, location: e.target.value }))} placeholder="Ciudad de México, Mexico" />
+                  </div>
+                  <div style={field}>
+                    <label style={label}>State (DB field)</label>
+                    <input style={input} value={targetedForm.state} onChange={e => setTargetedForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
+                  </div>
+                </>
+              )}
+
+              {targetedForm.source === 'apify' && targetedForm.targetSite === 'inmuebles24' && (
+                <>
+                  <div style={field}>
+                    <label style={label}>Search Mode</label>
+                    <select style={input} value={targetedForm.apifyMode} onChange={e => setTargetedForm(f => ({ ...f, apifyMode: e.target.value as 'urls' | 'filters' }))}>
+                      <option value="filters">Search filters</option>
+                      <option value="urls">Search URLs</option>
+                    </select>
+                    <p style={hint}>URL mode uses Inmuebles24 result/list pages directly.</p>
+                  </div>
+                  {targetedForm.apifyMode === 'urls' ? (
+                    <div style={{ ...field, gridColumn: '1 / -1' }}>
+                      <label style={label}>Inmuebles24 URLs</label>
+                      <textarea
+                        style={{ ...input, minHeight: 82, resize: 'vertical' }}
+                        value={targetedForm.urls}
+                        onChange={e => setTargetedForm(f => ({ ...f, urls: e.target.value }))}
+                        placeholder="https://www.inmuebles24.com/inmuebles-en-venta-en-edo.-de-mexico.html"
+                        required
+                      />
+                      <p style={hint}>One URL per line. Keep test runs tiny first.</p>
+                    </div>
+                  ) : (
+                    <>
+                      <div style={field}>
+                        <label style={label}>Keyword</label>
+                        <input style={input} value={targetedForm.query} onChange={e => setTargetedForm(f => ({ ...f, query: e.target.value }))} placeholder="roma norte, satelite, oficina..." />
+                      </div>
+                      <div style={field}>
+                        <label style={label}>Property Type</label>
+                        <select style={input} value={targetedForm.propertyType} onChange={e => setTargetedForm(f => ({ ...f, propertyType: e.target.value }))}>
+                          {INMUEBLES_PROPERTY_TYPES.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                        </select>
+                      </div>
+                      <div style={field}>
+                        <label style={label}>Operation Type</label>
+                        <select style={input} value={targetedForm.operationType} onChange={e => setTargetedForm(f => ({ ...f, operationType: e.target.value }))}>
+                          {INMUEBLES_OPERATION_TYPES.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                        </select>
+                      </div>
+                      <div style={field}>
+                        <label style={label}>Published Date</label>
+                        <select style={input} value={targetedForm.publishedDate} onChange={e => setTargetedForm(f => ({ ...f, publishedDate: e.target.value }))}>
+                          {INMUEBLES_PUBLISHED_DATES.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                        </select>
+                      </div>
+                    </>
+                  )}
+                  <div style={field}>
+                    <label style={label}>Sort Items By</label>
+                    <select style={input} value={targetedForm.sortBy} onChange={e => setTargetedForm(f => ({ ...f, sortBy: e.target.value }))}>
+                      {APIFY_SORT_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Page</label>
+                    <input style={input} type="number" min={1} max={50} value={targetedForm.page} onChange={e => setTargetedForm(f => ({ ...f, page: e.target.value }))} />
+                  </div>
+                </>
+              )}
+
+              {targetedForm.source === 'apify' && targetedForm.targetSite === 'mercadolibre' && (
+                <>
+                  <div style={field}>
+                    <label style={label}>Search</label>
+                    <input style={input} value={targetedForm.query} onChange={e => setTargetedForm(f => ({ ...f, query: e.target.value }))} placeholder="nissan march 2020, laptop, silla..." required />
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Search Category</label>
+                    <select style={input} value={targetedForm.searchCategory} onChange={e => setTargetedForm(f => ({ ...f, searchCategory: e.target.value }))}>
+                      {ML_SEARCH_CATEGORIES.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Sort Items By</label>
+                    <select style={input} value={targetedForm.sortBy} onChange={e => setTargetedForm(f => ({ ...f, sortBy: e.target.value }))}>
+                      {APIFY_SORT_OPTIONS.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </select>
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Domain</label>
+                    <select style={input} value={targetedForm.domainCode} onChange={e => setTargetedForm(f => ({ ...f, domainCode: e.target.value }))}>
+                      <option value="MX">Mexico</option>
+                      <option value="AR">Argentina</option>
+                      <option value="CO">Colombia</option>
+                      <option value="CL">Chile</option>
+                      <option value="BR">Brazil</option>
+                    </select>
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Vehicle Year <span style={{ fontWeight: 400, color: '#9ca3af' }}>(optional)</span></label>
+                    <input style={input} type="number" min={1900} max={2100} value={targetedForm.vehicleYear} onChange={e => setTargetedForm(f => ({ ...f, vehicleYear: e.target.value }))} placeholder="2020" />
+                  </div>
+                  <div style={{ ...field, display: 'flex', alignItems: 'center', gap: 8, marginTop: 24 }}>
+                    <input
+                      id="apify-fast-mode"
+                      type="checkbox"
+                      checked={targetedForm.fastMode}
+                      onChange={e => setTargetedForm(f => ({ ...f, fastMode: e.target.checked }))}
+                    />
+                    <label htmlFor="apify-fast-mode" style={{ ...label, marginBottom: 0 }}>Fast mode</label>
+                  </div>
+                </>
+              )}
+
+              {targetedForm.source === 'apify' && (
+                <>
+                  <div style={field}>
+                    <label style={label}>Category</label>
+                    <select style={input} value={targetedForm.category} onChange={e => setTargetedForm(f => ({ ...f, category: e.target.value }))}>
+                      {CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                    </select>
+                  </div>
+                  <div style={field}>
+                    <label style={label}>{targetedForm.targetSite === 'mercadolibre' ? 'Max Item Count' : 'Max Items Per URL'}</label>
+                    <input style={input} type="number" min={1} max={100} value={targetedForm.limit} onChange={e => setTargetedForm(f => ({ ...f, limit: e.target.value }))} />
+                  </div>
+                  <div style={field}>
+                    <label style={label}>Location (DB field)</label>
+                    <input style={input} value={targetedForm.location} onChange={e => setTargetedForm(f => ({ ...f, location: e.target.value }))} placeholder="Ciudad de México, Mexico" />
+                  </div>
+                  <div style={field}>
+                    <label style={label}>State (DB field)</label>
+                    <input style={input} value={targetedForm.state} onChange={e => setTargetedForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
+                  </div>
+                  {targetedForm.targetSite === 'inmuebles24' && (
+                    <>
+                      <div style={field}>
+                        <label style={label}>Max Retries Per URL</label>
+                        <input style={input} type="number" min={0} max={5} value={targetedForm.maxRetries} onChange={e => setTargetedForm(f => ({ ...f, maxRetries: e.target.value }))} />
+                      </div>
+                      <div style={{ ...field, display: 'flex', alignItems: 'center', gap: 8, marginTop: 24 }}>
+                        <input
+                          id="apify-ignore-url-failures"
+                          type="checkbox"
+                          checked={targetedForm.ignoreUrlFailures}
+                          onChange={e => setTargetedForm(f => ({ ...f, ignoreUrlFailures: e.target.checked }))}
+                        />
+                        <label htmlFor="apify-ignore-url-failures" style={{ ...label, marginBottom: 0 }}>Ignore URL failures</label>
+                      </div>
+                    </>
+                  )}
+                </>
+              )}
             </div>
-            <button type="submit" style={btn(targetedLoading)} disabled={targetedLoading || !apiKey}>
+            <button type="submit" style={btn(targetedLoading)} disabled={targetedLoading || (targetedForm.source === 'serpapi' ? !apiKey : !apifyApiKey)}>
               {targetedLoading && <Spinner />}
               {targetedLoading ? 'Collecting targeted rows...' : 'Collect Targeted Rows'}
             </button>
-            {!apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>API Key required.</p>}
+            {targetedForm.source === 'serpapi' && !apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>SerpAPI key required.</p>}
+            {targetedForm.source === 'apify' && !apifyApiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>Apify token required.</p>}
           </form>
           <ResultBanner result={targetedResult} loading={targetedLoading} secret={secret} sourceLabelStr="targeted" />
         </div>
