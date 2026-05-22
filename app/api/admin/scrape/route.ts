@@ -3,12 +3,16 @@ import { db } from '@/lib/supabase'
 import { collectSerpApiLocal, scrapeSerpApiLocal } from '@/lib/scrapers/serpapi'
 import { collectMLSeller, scrapeMercadoLibre, scrapeMLSeller } from '@/lib/scrapers/mercadolibre'
 import { collectTargetedWebsiteSearch } from '@/lib/scrapers/targeted'
-import { saveScrapeRunItems, type ScrapeCollectResult } from '@/lib/adminScrapeExport'
+import { saveScrapeRunItems, scrapeItemsToCsv, type ScrapeCollectResult } from '@/lib/adminScrapeExport'
 import type { TargetSearchSiteKey } from '@/lib/types'
 
 function checkSecret(req: NextRequest): boolean {
+  const adminSecret = process.env.ADMIN_SECRET
   const secret = req.headers.get('x-admin-secret') ?? req.nextUrl.searchParams.get('secret')
-  return secret === process.env.ADMIN_SECRET
+  if (!adminSecret) {
+    return !secret || secret === 'undefined' || secret === 'null' || secret === ''
+  }
+  return secret === adminSecret
 }
 
 export async function POST(req: NextRequest) {
@@ -20,24 +24,30 @@ export async function POST(req: NextRequest) {
     source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller' | 'targeted_website_search'
     mode?: 'collect_only' | 'direct_import'
     params: Record<string, string | number>
+    apiKey?: string
   }
-  const { source, params } = body
+  const { source, params, apiKey } = body
   const mode = body.mode ?? 'collect_only'
 
-  // Create run record
-  const { data: run, error: runErr } = await db
-    .from('marketplace_scrape_runs')
-    .insert({ source, params, status: 'running' })
-    .select('id')
-    .single()
+  const hasDb = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
+  const runId = hasDb ? crypto.randomUUID() : `local-${Date.now()}`
+  let dbRunId: string | null = null
 
-  if (runErr || !run) {
-    return NextResponse.json({ error: 'Failed to create run record' }, { status: 500 })
+  if (hasDb) {
+    const { data: run, error: runErr } = await db
+      .from('marketplace_scrape_runs')
+      .insert({ id: runId, source, params, status: 'running' })
+      .select('id')
+      .single()
+
+    if (runErr || !run) {
+      return NextResponse.json({ error: 'Failed to create run record' }, { status: 500 })
+    }
+    dbRunId = run.id
   }
 
-  // Run scraper synchronously and return result
   try {
-    if (mode === 'direct_import') {
+    if (mode === 'direct_import' && hasDb) {
       let result: { inserted: number; skipped: number; errors: number; sellerNickname?: string }
 
       if (source === 'serpapi_google_local') {
@@ -47,6 +57,7 @@ export async function POST(req: NextRequest) {
           state: String(params.state ?? 'Ciudad de México'),
           category: String(params.category ?? 'servicios'),
           limit: Number(params.limit ?? 20),
+          apiKey,
         })
       } else if (source === 'mercadolibre_public') {
         result = await scrapeMercadoLibre({
@@ -72,9 +83,9 @@ export async function POST(req: NextRequest) {
         count_skipped: result.skipped,
         count_errors: result.errors,
         completed_at: new Date().toISOString(),
-      }).eq('id', run.id)
+      }).eq('id', dbRunId)
 
-      return NextResponse.json({ runId: run.id, mode, ...result })
+      return NextResponse.json({ runId: dbRunId, mode, ...result })
     }
 
     let result: ScrapeCollectResult
@@ -86,6 +97,7 @@ export async function POST(req: NextRequest) {
         state: String(params.state ?? 'Ciudad de México'),
         category: String(params.category ?? 'servicios'),
         limit: Number(params.limit ?? 20),
+        apiKey,
       })
     } else if (source === 'mercadolibre_seller') {
       result = await collectMLSeller({
@@ -108,18 +120,22 @@ export async function POST(req: NextRequest) {
       throw new Error(`Unknown source: ${source}`)
     }
 
-    await saveScrapeRunItems(run.id, result.items)
+    if (hasDb && dbRunId) {
+      await saveScrapeRunItems(dbRunId, result.items)
 
-    await db.from('marketplace_scrape_runs').update({
-      status: 'completed',
-      count_inserted: result.items.length,
-      count_skipped: result.skipped,
-      count_errors: result.errors,
-      completed_at: new Date().toISOString(),
-    }).eq('id', run.id)
+      await db.from('marketplace_scrape_runs').update({
+        status: 'completed',
+        count_inserted: result.items.length,
+        count_skipped: result.skipped,
+        count_errors: result.errors,
+        completed_at: new Date().toISOString(),
+      }).eq('id', dbRunId)
+    }
+
+    const csvData = !hasDb ? scrapeItemsToCsv(result.items) : undefined
 
     return NextResponse.json({
-      runId: run.id,
+      runId: dbRunId ?? runId,
       mode,
       inserted: result.items.length,
       collected: result.items.length,
@@ -127,13 +143,16 @@ export async function POST(req: NextRequest) {
       errors: result.errors,
       sellerNickname: result.sellerNickname,
       stats: result.stats,
+      csvData,
     })
   } catch (e) {
-    await db.from('marketplace_scrape_runs').update({
-      status: 'failed',
-      error_message: String(e),
-      completed_at: new Date().toISOString(),
-    }).eq('id', run.id)
-    return NextResponse.json({ error: String(e), runId: run.id }, { status: 500 })
+    if (hasDb && dbRunId) {
+      await db.from('marketplace_scrape_runs').update({
+        status: 'failed',
+        error_message: String(e),
+        completed_at: new Date().toISOString(),
+      }).eq('id', dbRunId)
+    }
+    return NextResponse.json({ error: String(e), runId: dbRunId ?? runId }, { status: 500 })
   }
 }

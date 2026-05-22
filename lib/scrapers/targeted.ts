@@ -16,6 +16,7 @@ export interface TargetedSearchParams {
   state?: string
   location?: string
   limit?: number
+  apiKey?: string
 }
 
 interface ParsedListing {
@@ -288,7 +289,8 @@ export async function collectTargetedWebsiteSearch(params: TargetedSearchParams)
   const { query, targetSite, category, state, location, limit = 20 } = params
   const target = TARGET_SITE_MAP[targetSite]
   if (!target) throw new Error(`Unknown targeted search site: ${targetSite}`)
-  if (!process.env.SERPAPI_KEY) throw new Error('SERPAPI_KEY is not set')
+  const apiKey = params.apiKey || process.env.SERPAPI_KEY
+  if (!apiKey) throw new Error('SERPAPI_KEY is not set')
 
   const collected: SerpOrganicResult[] = []
   const seenUrls = new Set<string>()
@@ -304,7 +306,7 @@ export async function collectTargetedWebsiteSearch(params: TargetedSearchParams)
     searchUrl.searchParams.set('hl', 'es')
     searchUrl.searchParams.set('num', '10')
     if (page > 0) searchUrl.searchParams.set('start', String(page * 10))
-    searchUrl.searchParams.set('api_key', process.env.SERPAPI_KEY)
+    searchUrl.searchParams.set('api_key', apiKey)
 
     const res = await fetch(searchUrl.toString(), {
       signal: AbortSignal.timeout(15000),

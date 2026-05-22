@@ -27,6 +27,7 @@ export interface MLSellerScrapeParams {
   sellerUrl: string   // Any ML seller page: /pagina/NICKNAME, /perfil/ID, or listing URL with MLM-ID
   category?: string
   limit?: number      // default 50 (Google has ~50 results per seller)
+  apiKey?: string
 }
 
 interface SerpResult {
@@ -315,9 +316,10 @@ export async function scrapeMLSeller(params: MLSellerScrapeParams): Promise<Scra
 }
 
 export async function collectMLSeller(params: MLSellerScrapeParams): Promise<ScrapeCollectResult> {
-  const { sellerUrl, category, limit = 50 } = params
+  const { sellerUrl, category, limit = 50, apiKey } = params
 
-  if (!process.env.SERPAPI_KEY) {
+  const targetApiKey = apiKey || process.env.SERPAPI_KEY
+  if (!targetApiKey) {
     throw new Error('SERPAPI_KEY is not set - required for ML seller scraping')
   }
 
@@ -334,7 +336,7 @@ export async function collectMLSeller(params: MLSellerScrapeParams): Promise<Scr
     searchUrl.searchParams.set('hl', 'es')
     searchUrl.searchParams.set('num', '10')
     if (page > 0) searchUrl.searchParams.set('start', String(page * 10))
-    searchUrl.searchParams.set('api_key', process.env.SERPAPI_KEY)
+    searchUrl.searchParams.set('api_key', targetApiKey)
 
     const res = await fetch(searchUrl.toString(), {
       signal: AbortSignal.timeout(15000),

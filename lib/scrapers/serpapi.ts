@@ -8,6 +8,7 @@ export interface SerpApiScrapeParams {
   state: string       // for DB field: e.g. "Ciudad de México"
   category?: string   // defaults to 'servicios'
   limit?: number      // default 20
+  apiKey?: string     // Local API key for database-less execution
 }
 
 export interface ScrapeResult {
@@ -136,7 +137,9 @@ export async function collectSerpApiLocal(params: SerpApiScrapeParams): Promise<
   url.searchParams.set('location', location)
   url.searchParams.set('hl', 'es')
   url.searchParams.set('gl', 'mx')
-  url.searchParams.set('api_key', process.env.SERPAPI_KEY!)
+  const apiKey = params.apiKey || process.env.SERPAPI_KEY
+  if (!apiKey) throw new Error('Missing SerpAPI key')
+  url.searchParams.set('api_key', apiKey)
 
   const res = await fetch(url.toString(), { cache: 'no-store' })
   if (!res.ok) throw new Error(`SerpAPI HTTP ${res.status}`)

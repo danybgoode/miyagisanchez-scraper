@@ -14,6 +14,8 @@ interface ScrapeRun {
   error_message: string | null
   started_at: string
   completed_at: string | null
+  csvData?: string
+  isLocal?: boolean
 }
 
 interface RunResult {
@@ -24,6 +26,7 @@ interface RunResult {
   error?: string
   runId?: string
   sellerNickname?: string
+  csvData?: string
   stats?: {
     fetched: number
     parsed: number
@@ -69,7 +72,19 @@ function sourceLabel(source: string): string {
   return 'ML Keyword'
 }
 
-function ResultBanner({ result, loading, secret }: { result: RunResult | null; loading: boolean; secret: string }) {
+function downloadCsv(csvData: string, filename: string) {
+  const blob = new Blob([csvData], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: RunResult | null; loading: boolean; secret: string; sourceLabelStr: string }) {
   if (loading) return (
     <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 6, backgroundColor: '#f0f9ff', border: '1px solid #bae6fd', fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
       <Spinner color="#0369a1" />
@@ -91,9 +106,17 @@ function ResultBanner({ result, loading, secret }: { result: RunResult | null; l
             <span style={{ color: '#166534' }}>Collected <strong>{result.collected ?? result.inserted}</strong></span>
             <span style={{ color: '#475569' }}>Auto-skipped <strong>{result.stats?.autoSkipped ?? result.skipped ?? 0}</strong></span>
             {(result.errors ?? 0) > 0 && <span style={{ color: '#dc2626' }}>Errors <strong>{result.errors}</strong></span>}
-            {result.runId && (
-              <a href={`/api/admin/runs/${result.runId}/csv?secret=${encodeURIComponent(secret)}`} style={{ color: '#166534', fontWeight: 600 }}>
+            {result.csvData && (
+              <button 
+                onClick={() => downloadCsv(result.csvData!, `scrape_${sourceLabelStr}_${Date.now()}.csv`)}
+                style={{ color: '#166534', fontWeight: 600, background: 'none', border: 'none', cursor: 'pointer', padding: 0, fontSize: 14 }}
+              >
                 Download CSV
+              </button>
+            )}
+            {result.runId && !result.csvData && (
+              <a href={`/api/admin/runs/${result.runId}/csv?secret=${encodeURIComponent(secret)}`} style={{ color: '#166534', fontWeight: 600 }}>
+                Download CSV (DB)
               </a>
             )}
           </div>
@@ -147,7 +170,9 @@ interface TargetedFormState {
 }
 
 export default function AdminScrapeClient({ secret }: { secret: string }) {
+  const [apiKey, setApiKey] = useState('')
   const [runs, setRuns] = useState<ScrapeRun[]>([])
+  
   const [serpForm, setSerpForm] = useState<SerpApiFormState>({
     query: '',
     location: 'Ciudad de México, Mexico',
@@ -184,23 +209,98 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [mlSellerResult, setMlSellerResult] = useState<RunResult | null>(null)
   const [targetedResult, setTargetedResult] = useState<RunResult | null>(null)
 
-  const fetchRuns = useCallback(async () => {
-    const res = await fetch(`/api/admin/runs?secret=${encodeURIComponent(secret)}`)
-    if (res.ok) {
-      const json = await res.json() as { runs: ScrapeRun[] }
-      setRuns(json.runs)
+  useEffect(() => {
+    const savedKey = localStorage.getItem('miyagi_serpapi_key')
+    if (savedKey) setApiKey(savedKey)
+  }, [])
+
+  const handleApiKeyChange = (val: string) => {
+    setApiKey(val)
+    localStorage.setItem('miyagi_serpapi_key', val)
+  }
+
+  const getLocalRuns = useCallback((): ScrapeRun[] => {
+    try {
+      const stored = localStorage.getItem('miyagi_local_runs')
+      if (stored) return JSON.parse(stored) as ScrapeRun[]
+    } catch (e) {
+      console.error('Failed to parse local runs', e)
     }
-  }, [secret])
+    return []
+  }, [])
+
+  const saveLocalRun = useCallback((run: ScrapeRun) => {
+    const runs = getLocalRuns()
+    runs.unshift(run)
+    if (runs.length > 20) runs.length = 20 // Keep last 20 runs
+    localStorage.setItem('miyagi_local_runs', JSON.stringify(runs))
+  }, [getLocalRuns])
+
+  const fetchRuns = useCallback(async () => {
+    let serverRuns: ScrapeRun[] = []
+    let isLocalOnly = false
+    try {
+      const res = await fetch(`/api/admin/runs?secret=${encodeURIComponent(secret)}`)
+      if (res.ok) {
+        const json = await res.json() as { runs: ScrapeRun[], isLocalOnly?: boolean }
+        serverRuns = json.runs || []
+        isLocalOnly = !!json.isLocalOnly
+      }
+    } catch (e) {
+      console.error(e)
+    }
+
+    const localRuns = getLocalRuns()
+    // Merge, local runs take precedence if IDs match, and order by started_at desc
+    const merged = [...localRuns, ...serverRuns]
+    const unique = Array.from(new Map(merged.map(r => [r.id, r])).values())
+    unique.sort((a, b) => new Date(b.started_at).getTime() - new Date(a.started_at).getTime())
+    
+    setRuns(unique)
+  }, [secret, getLocalRuns])
 
   useEffect(() => {
     const timer = window.setTimeout(() => { void fetchRuns() }, 0)
     return () => window.clearTimeout(timer)
   }, [fetchRuns])
 
+  async function handleScrapeResponse(res: Response, source: string, params: any) {
+    const json = await res.json() as RunResult
+    if (res.ok) {
+      if (json.csvData) {
+        // Automatically download CSV if returned
+        downloadCsv(json.csvData, `scrape_${source}_${Date.now()}.csv`)
+        // Save to local runs
+        saveLocalRun({
+          id: json.runId || `local-${Date.now()}`,
+          source,
+          params,
+          status: 'completed',
+          count_inserted: json.inserted || json.collected || 0,
+          count_skipped: json.skipped || 0,
+          count_errors: json.errors || 0,
+          error_message: null,
+          started_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+          csvData: json.csvData,
+          isLocal: true,
+        })
+      }
+    }
+    return json
+  }
+
   async function runSerpApi(e: React.FormEvent) {
     e.preventDefault()
     setSerpLoading(true)
     setSerpResult(null)
+    const params = {
+      query: serpForm.query,
+      location: serpForm.location,
+      state: serpForm.state,
+      category: serpForm.category,
+      limit: Number(serpForm.limit),
+    }
     try {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
@@ -208,16 +308,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         body: JSON.stringify({
           source: 'serpapi_google_local',
           mode: 'collect_only',
-          params: {
-            query: serpForm.query,
-            location: serpForm.location,
-            state: serpForm.state,
-            category: serpForm.category,
-            limit: Number(serpForm.limit),
-          },
+          params,
+          apiKey,
         }),
       })
-      const json = await res.json() as RunResult
+      const json = await handleScrapeResponse(res, 'serpapi_google_local', params)
       setSerpResult(json)
       await fetchRuns()
     } catch (err) {
@@ -231,6 +326,12 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     e.preventDefault()
     setMlLoading(true)
     setMlResult(null)
+    const params = {
+      query: mlForm.query,
+      category: mlForm.category,
+      limit: Number(mlForm.limit),
+      ...(mlForm.clerkUserId ? { clerkUserId: mlForm.clerkUserId } : {}),
+    }
     try {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
@@ -238,15 +339,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         body: JSON.stringify({
           source: 'mercadolibre_public',
           mode: 'collect_only',
-          params: {
-            query: mlForm.query,
-            category: mlForm.category,
-            limit: Number(mlForm.limit),
-            ...(mlForm.clerkUserId ? { clerkUserId: mlForm.clerkUserId } : {}),
-          },
+          params,
+          apiKey,
         }),
       })
-      const json = await res.json() as RunResult
+      const json = await handleScrapeResponse(res, 'mercadolibre_public', params)
       setMlResult(json)
       await fetchRuns()
     } catch (err) {
@@ -260,6 +357,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     e.preventDefault()
     setMlSellerLoading(true)
     setMlSellerResult(null)
+    const params = {
+      sellerUrl: mlSellerForm.sellerUrl,
+      category: mlSellerForm.category,
+      limit: Number(mlSellerForm.limit),
+    }
     try {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
@@ -267,14 +369,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         body: JSON.stringify({
           source: 'mercadolibre_seller',
           mode: 'collect_only',
-          params: {
-            sellerUrl: mlSellerForm.sellerUrl,
-            category: mlSellerForm.category,
-            limit: Number(mlSellerForm.limit),
-          },
+          params,
+          apiKey,
         }),
       })
-      const json = await res.json() as RunResult
+      const json = await handleScrapeResponse(res, 'mercadolibre_seller', params)
       setMlSellerResult(json)
       await fetchRuns()
     } catch (err) {
@@ -288,6 +387,14 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     e.preventDefault()
     setTargetedLoading(true)
     setTargetedResult(null)
+    const params = {
+      query: targetedForm.query,
+      targetSite: targetedForm.targetSite,
+      category: targetedForm.category,
+      location: targetedForm.location,
+      state: targetedForm.state,
+      limit: Number(targetedForm.limit),
+    }
     try {
       const res = await fetch('/api/admin/scrape', {
         method: 'POST',
@@ -295,17 +402,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         body: JSON.stringify({
           source: 'targeted_website_search',
           mode: 'collect_only',
-          params: {
-            query: targetedForm.query,
-            targetSite: targetedForm.targetSite,
-            category: targetedForm.category,
-            location: targetedForm.location,
-            state: targetedForm.state,
-            limit: Number(targetedForm.limit),
-          },
+          params,
+          apiKey,
         }),
       })
-      const json = await res.json() as RunResult
+      const json = await handleScrapeResponse(res, 'targeted_website_search', params)
       setTargetedResult(json)
       await fetchRuns()
     } catch (err) {
@@ -358,6 +459,23 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
 
       <div style={{ maxWidth: 900, margin: '0 auto', padding: '32px 24px' }}>
 
+        {/* Global Settings */}
+        <div style={card}>
+          <h2 style={sectionTitle}>⚙️ Local Settings</h2>
+          <p style={sectionSub}>Configure your local API keys for database-less execution.</p>
+          <div style={field}>
+            <label style={label}>SerpAPI Key</label>
+            <input 
+              style={input} 
+              type="password"
+              value={apiKey} 
+              onChange={e => handleApiKeyChange(e.target.value)} 
+              placeholder="Paste your SerpAPI key here (saved locally)" 
+            />
+            <p style={hint}>Required for Google Local and Targeted Website Search.</p>
+          </div>
+        </div>
+
         {/* ── SerpAPI ─────────────────────────────── */}
         <div style={card}>
           <h2 style={sectionTitle}>🔍 SerpAPI — Google Local</h2>
@@ -387,12 +505,13 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                 <input style={input} type="number" min={1} max={50} value={serpForm.limit} onChange={e => setSerpForm(f => ({ ...f, limit: e.target.value }))} />
               </div>
             </div>
-            <button type="submit" style={btn(serpLoading)} disabled={serpLoading}>
+            <button type="submit" style={btn(serpLoading)} disabled={serpLoading || !apiKey}>
               {serpLoading && <Spinner />}
               {serpLoading ? 'Collecting…' : 'Collect CSV Rows'}
             </button>
+            {!apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>API Key required.</p>}
           </form>
-          <ResultBanner result={serpResult} loading={serpLoading} secret={secret} />
+          <ResultBanner result={serpResult} loading={serpLoading} secret={secret} sourceLabelStr="google_local" />
         </div>
 
         {/* Targeted website search */}
@@ -447,12 +566,13 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                 <input style={input} value={targetedForm.state} onChange={e => setTargetedForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
               </div>
             </div>
-            <button type="submit" style={btn(targetedLoading)} disabled={targetedLoading}>
+            <button type="submit" style={btn(targetedLoading)} disabled={targetedLoading || !apiKey}>
               {targetedLoading && <Spinner />}
               {targetedLoading ? 'Collecting targeted rows...' : 'Collect Targeted Rows'}
             </button>
+            {!apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>API Key required.</p>}
           </form>
-          <ResultBanner result={targetedResult} loading={targetedLoading} secret={secret} />
+          <ResultBanner result={targetedResult} loading={targetedLoading} secret={secret} sourceLabelStr="targeted" />
         </div>
 
         {/* ── ML Keyword ──────────────────────────── */}
@@ -489,7 +609,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
               {mlLoading ? 'Checking…' : 'Check Availability'}
             </button>
           </form>
-          <ResultBanner result={mlResult} loading={mlLoading} secret={secret} />
+          <ResultBanner result={mlResult} loading={mlLoading} secret={secret} sourceLabelStr="ml_public" />
         </div>
 
         {/* ── ML Seller targeting ─────────────────── */}
@@ -528,12 +648,13 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                 <input style={input} type="number" min={1} max={50} value={mlSellerForm.limit} onChange={e => setMlSellerForm(f => ({ ...f, limit: e.target.value }))} />
               </div>
             </div>
-            <button type="submit" style={btn(mlSellerLoading)} disabled={mlSellerLoading}>
+            <button type="submit" style={btn(mlSellerLoading)} disabled={mlSellerLoading || !apiKey}>
               {mlSellerLoading && <Spinner />}
               {mlSellerLoading ? 'Collecting seller…' : '🎯 Collect Seller Listings'}
             </button>
+            {!apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>API Key required.</p>}
           </form>
-          <ResultBanner result={mlSellerResult} loading={mlSellerLoading} secret={secret} />
+          <ResultBanner result={mlSellerResult} loading={mlSellerLoading} secret={secret} sourceLabelStr="ml_seller" />
         </div>
 
         {/* ── Runs history ───────────────────────── */}
@@ -559,6 +680,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                     <tr key={run.id} style={{ borderBottom: '1px solid #f3f4f6' }}>
                       <td style={{ padding: '8px 10px', fontWeight: 500, whiteSpace: 'nowrap' }}>
                         {sourceLabel(run.source)}
+                        {run.isLocal && <span style={{ marginLeft: 6, fontSize: 10, color: '#3b82f6', background: '#dbeafe', padding: '2px 4px', borderRadius: 4 }}>Local</span>}
                       </td>
                       <td style={{ padding: '8px 10px', color: '#6b7280', maxWidth: 200 }}>
                         <span title={JSON.stringify(run.params)} style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block', fontSize: 12 }}>
@@ -575,7 +697,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                       <td style={{ padding: '8px 10px', textAlign: 'center', color: run.count_errors > 0 ? '#dc2626' : '#6b7280' }}>{run.count_errors ?? 0}</td>
                       <td style={{ padding: '8px 10px', whiteSpace: 'nowrap' }}>
                         {run.status === 'completed' && (run.count_inserted ?? 0) > 0 ? (
-                          <a href={`/api/admin/runs/${run.id}/csv?secret=${encodeURIComponent(secret)}`} style={{ color: '#2563eb', fontWeight: 600 }}>Download</a>
+                          run.csvData ? (
+                            <button onClick={() => downloadCsv(run.csvData!, `scrape_${run.id}.csv`)} style={{ color: '#2563eb', fontWeight: 600, background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>Download</button>
+                          ) : (
+                            <a href={`/api/admin/runs/${run.id}/csv?secret=${encodeURIComponent(secret)}`} style={{ color: '#2563eb', fontWeight: 600 }}>Download (DB)</a>
+                          )
                         ) : (
                           <span style={{ color: '#9ca3af' }}>-</span>
                         )}
