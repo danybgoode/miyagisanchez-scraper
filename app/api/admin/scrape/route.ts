@@ -160,6 +160,9 @@ export async function POST(req: NextRequest) {
         limit: Number(params.limit ?? 20),
         serpApiKey: apiKey,
         geminiApiKey,
+        assistMode: params.assistMode === 'normalize' ? 'normalize' : 'enrich',
+        imageEnrichment: params.imageEnrichment !== false,
+        strictItemPages: params.strictItemPages !== false,
       })
     } else if (source === 'mercadolibre_public') {
       throw new Error('ML keyword search remains blocked for Mexico. Use Seller Targeting or the new /supply CSV workflow.')

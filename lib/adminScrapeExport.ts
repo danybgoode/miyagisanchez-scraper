@@ -51,6 +51,7 @@ export interface ScrapeCollectStats {
   invalid: number
   autoSkipped: number
   avgQuality: number
+  stageLog?: string[]
 }
 
 export const SCRAPE_CSV_HEADERS = [

@@ -3,6 +3,7 @@ import { TARGET_SEARCH_SITES, type TargetSearchSiteKey } from '../types'
 import { summarizeCollectedItems, withQuality } from './quality'
 
 type InputMode = 'search' | 'urls' | 'mercadolibre_seller' | 'inmuebles24_search'
+type AssistMode = 'normalize' | 'enrich'
 
 export interface AiAssistedScrapeParams {
   inputMode?: InputMode
@@ -17,6 +18,9 @@ export interface AiAssistedScrapeParams {
   limit?: number
   serpApiKey?: string
   geminiApiKey?: string
+  assistMode?: AssistMode
+  imageEnrichment?: boolean
+  strictItemPages?: boolean
 }
 
 interface SerpOrganicResult {
@@ -25,6 +29,15 @@ interface SerpOrganicResult {
   snippet?: string
   displayed_link?: string
   position?: number
+  thumbnail?: string
+}
+
+interface SerpImageResult {
+  title?: string
+  link?: string
+  source?: string
+  thumbnail?: string
+  original?: string
 }
 
 interface RawCandidate {
@@ -38,6 +51,10 @@ interface RawCandidate {
   imageUrl: string | null
   priceText: string | null
   fetchStatus: 'parsed' | 'fetch_failed' | 'not_fetched'
+  isItemPage: boolean
+  isCollectionPage: boolean
+  enrichmentNotes: string[]
+  supplementalSnippets: string[]
   candidates: {
     title: FieldCandidate[]
     description: FieldCandidate[]
@@ -60,6 +77,8 @@ interface GeminiSupplyRow {
   listing_type: 'product' | 'service' | 'rental' | 'digital' | null
   condition: string | null
   confidence: number | null
+  evidence_summary: string | null
+  missing_fields: string[] | null
   skip_reason: string | null
 }
 
@@ -109,13 +128,23 @@ function titleTag(html: string): string | null {
   return decodeHtml(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]?.replace(/<[^>]+>/g, '')) ?? null
 }
 
-function visiblePrice(html: string): string | null {
-  const text = html
+function visibleText(html: string): string {
+  return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
-  return cleanText(text.match(/(?:MXN|M\.N\.|\$)\s*[\d,.]+(?:\s*mil)?/i)?.[0]) ?? null
+}
+
+function allPriceTexts(text: string | null | undefined): string[] {
+  if (!text) return []
+  const results: string[] = []
+  const re = /(?:renta|precio|desde)?\s*(?:MN|MXN|M\.N\.|\$|mx\$)\s*[\d,.]+(?:\s*mil)?(?:\/mes)?/gi
+  for (const match of text.matchAll(re)) {
+    const value = cleanText(match[0], 80)
+    if (value && !results.includes(value)) results.push(value)
+  }
+  return results
 }
 
 function parsePriceCents(value: unknown): number | null {
@@ -125,7 +154,7 @@ function parsePriceCents(value: unknown): number | null {
     return Math.round(value * 100)
   }
   const textValue = String(value)
-  const match = textValue.match(/(?:MXN|M\.N\.|\$)?\s*([\d.,]+(?:\s*mil)?)/i)
+  const match = textValue.match(/(?:MN|MXN|M\.N\.|\$|mx\$)?\s*([\d.,]+(?:\s*mil)?)/i)
   if (!match) return null
   let text = match[1].toLowerCase().replace(/\s+/g, '')
   const hasMil = text.includes('mil')
@@ -158,7 +187,7 @@ function textFromUrl(url: string): string {
     return decodeURIComponent(parsed.pathname)
       .replace(/\.html?$/i, '')
       .replace(/[_/.-]+/g, ' ')
-      .replace(/\b(?:NoIndex|True|ITEM|CONDITION|CustId)\b/gi, ' ')
+      .replace(/\b(?:NoIndex|True|ITEM|CONDITION|CustId|clasificado|alclapin)\b/gi, ' ')
       .replace(/\s+/g, ' ')
       .trim()
   } catch {
@@ -173,22 +202,56 @@ function sourcePlatformFromUrl(url: string, fallback: TargetSearchSiteKey): stri
   return fallback
 }
 
+function isLikelyItemPage(url: string, platform: string): boolean {
+  if (platform === 'inmuebles24') return /\/propiedades\/clasificado\//i.test(url)
+  if (platform === 'mercadolibre') return /\/MLM[-_]?\d+/i.test(url)
+  return true
+}
+
+function isLikelyCollectionPage(url: string, platform: string): boolean {
+  if (platform === 'inmuebles24') return /\/(?:departamentos|inmuebles|casas|oficinas)-en-/i.test(url) && !isLikelyItemPage(url, platform)
+  if (platform === 'mercadolibre') return /\/_(?:ITEM|CustId|NoIndex)|\/_DisplayType|\/_Desde_/i.test(url) && !isLikelyItemPage(url, platform)
+  return false
+}
+
 function queryForSeed(seed: string, targetSite: TargetSearchSiteKey, mode: InputMode): string {
   const target = TARGET_SITE_MAP[targetSite]
   if (mode === 'mercadolibre_seller') {
     const custId = seed.match(/_CustId_(\d+)/i)?.[1]
-    const sellerTerm = custId ? `${custId} vehiculos` : textFromUrl(seed)
-    return `(site:auto.mercadolibre.com.mx OR site:articulo.mercadolibre.com.mx OR site:vehiculos.mercadolibre.com.mx) ${sellerTerm}`.trim()
+    const sellerTerm = custId ? `${custId} vehiculos autos` : textFromUrl(seed)
+    return `(site:auto.mercadolibre.com.mx OR site:articulo.mercadolibre.com.mx) MLM ${sellerTerm}`.trim()
   }
   if (targetSite === 'mercadolibre') {
     const text = mode === 'search' ? seed : textFromUrl(seed)
-    return `site:auto.mercadolibre.com.mx MLM autos ${text}`.trim()
+    return `site:auto.mercadolibre.com.mx/MLM MLM autos ${text}`.trim()
   }
   if (targetSite === 'inmuebles24') {
     const text = mode === 'search' ? seed : textFromUrl(seed)
-    return `site:inmuebles24.com ${text}`.trim()
+    return `site:inmuebles24.com/propiedades/clasificado departamentos renta ${text}`.trim()
   }
   return `${target?.queryPrefix ?? ''} ${mode === 'search' ? seed : textFromUrl(seed)}`.trim()
+}
+
+function supplementalQuery(candidate: RawCandidate): string {
+  const title = candidate.htmlTitle ?? candidate.googleTitle ?? textFromUrl(candidate.sourceUrl)
+  if (candidate.sourcePlatform === 'inmuebles24') {
+    return `site:inmuebles24.com/propiedades/clasificado "${title.replace(/"/g, '')}" MN`
+  }
+  if (candidate.sourcePlatform === 'mercadolibre') {
+    return `site:auto.mercadolibre.com.mx/MLM "${title.replace(/"/g, '')}" precio imagen`
+  }
+  return `${candidate.sourceUrl} ${title}`
+}
+
+function imageQuery(candidate: RawCandidate): string {
+  const title = candidate.htmlTitle ?? candidate.googleTitle ?? textFromUrl(candidate.sourceUrl)
+  if (candidate.sourcePlatform === 'inmuebles24') {
+    return `site:inmuebles24.com/propiedades/clasificado ${title} Inmuebles24`
+  }
+  if (candidate.sourcePlatform === 'mercadolibre') {
+    return `site:auto.mercadolibre.com.mx/MLM ${title} MercadoLibre auto`
+  }
+  return `${title} ${candidate.sourceUrl}`
 }
 
 function normalizedUrl(url: string): string {
@@ -201,6 +264,22 @@ function normalizedUrl(url: string): string {
     return parsed.toString()
   } catch {
     return url
+  }
+}
+
+function pushCandidate(list: FieldCandidate[], value: string | number | null, source: string) {
+  if (value === null || value === '') return
+  if (list.some(item => item.value === value)) return
+  list.push({ value, source })
+}
+
+function addPriceCandidates(candidate: RawCandidate, text: string | null | undefined, source: string) {
+  for (const priceText of allPriceTexts(text)) {
+    const cents = parsePriceCents(priceText)
+    if (cents) {
+      pushCandidate(candidate.candidates.priceCents, cents, source)
+      if (!candidate.priceText) candidate.priceText = priceText
+    }
   }
 }
 
@@ -238,10 +317,31 @@ async function searchSerpApi(query: string, apiKey: string, limit: number): Prom
   return results
 }
 
+async function searchSerpApiImages(query: string, apiKey: string): Promise<SerpImageResult[]> {
+  const url = new URL('https://serpapi.com/search.json')
+  url.searchParams.set('engine', 'google_images')
+  url.searchParams.set('q', query)
+  url.searchParams.set('gl', 'mx')
+  url.searchParams.set('hl', 'es')
+  url.searchParams.set('ijn', '0')
+  url.searchParams.set('api_key', apiKey)
+
+  const res = await fetch(url.toString(), {
+    signal: AbortSignal.timeout(15000),
+    cache: 'no-store',
+  })
+  if (!res.ok) return []
+  const data = await res.json() as { images_results?: SerpImageResult[]; error?: string }
+  if (data.error) return []
+  return data.images_results ?? []
+}
+
 async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite: TargetSearchSiteKey): Promise<RawCandidate | null> {
   const sourceUrl = result.link
   if (!sourceUrl) return null
   const sourcePlatform = sourcePlatformFromUrl(sourceUrl, targetSite)
+  const isItemPage = isLikelyItemPage(sourceUrl, sourcePlatform)
+  const isCollectionPage = isLikelyCollectionPage(sourceUrl, sourcePlatform)
   const base: RawCandidate = {
     seed,
     sourceUrl,
@@ -250,16 +350,29 @@ async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite
     googleSnippet: cleanText(result.snippet, 1000),
     htmlTitle: null,
     htmlDescription: null,
-    imageUrl: null,
+    imageUrl: cleanText(result.thumbnail, 1000),
     priceText: null,
     fetchStatus: 'fetch_failed',
+    isItemPage,
+    isCollectionPage,
+    enrichmentNotes: [
+      isItemPage ? 'item_url_detected' : 'not_item_url',
+      isCollectionPage ? 'collection_url_detected' : 'not_collection_url',
+    ],
+    supplementalSnippets: [],
     candidates: {
-      title: result.title ? [{ value: cleanText(result.title, 300) ?? result.title, source: 'google:title' }] : [],
-      description: result.snippet ? [{ value: cleanText(result.snippet, 1000) ?? result.snippet, source: 'google:snippet' }] : [],
+      title: [],
+      description: [],
       priceCents: [],
       imageUrl: [],
     },
   }
+
+  pushCandidate(base.candidates.title, cleanText(result.title, 300), 'google:title')
+  pushCandidate(base.candidates.description, cleanText(result.snippet, 1000), 'google:snippet')
+  pushCandidate(base.candidates.imageUrl, base.imageUrl, 'google:thumbnail')
+  addPriceCandidates(base, result.title, 'google:title')
+  addPriceCandidates(base, result.snippet, 'google:snippet')
 
   try {
     const res = await fetch(sourceUrl, {
@@ -270,54 +383,103 @@ async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite
       signal: AbortSignal.timeout(9000),
       cache: 'no-store',
     })
-    if (!res.ok) return base
+    if (!res.ok) {
+      base.enrichmentNotes.push(`direct_fetch_http_${res.status}`)
+      return base
+    }
     const html = await res.text()
     const htmlTitle = firstMeta(html, ['og:title', 'twitter:title']) ?? titleTag(html)
     const htmlDescription = firstMeta(html, ['og:description', 'twitter:description', 'description'])
     const imageUrl = firstMeta(html, ['og:image', 'twitter:image', 'image'])
-    const priceText = firstMeta(html, ['product:price:amount', 'og:price:amount', 'price', 'twitter:data1']) ?? visiblePrice(html)
-    const priceCents = parsePriceCents(priceText)
+    const priceText = firstMeta(html, ['product:price:amount', 'og:price:amount', 'price', 'twitter:data1']) ?? allPriceTexts(visibleText(html))[0] ?? null
 
-    return {
+    const parsed: RawCandidate = {
       ...base,
       htmlTitle,
       htmlDescription,
-      imageUrl,
-      priceText,
+      imageUrl: imageUrl ?? base.imageUrl,
+      priceText: priceText ?? base.priceText,
       fetchStatus: 'parsed',
-      candidates: {
-        title: [
-          ...(htmlTitle ? [{ value: htmlTitle, source: 'html:title' }] : []),
-          ...base.candidates.title,
-        ],
-        description: [
-          ...(htmlDescription ? [{ value: htmlDescription, source: 'html:description' }] : []),
-          ...base.candidates.description,
-        ],
-        priceCents: priceCents ? [{ value: priceCents, source: 'html:price' }] : [],
-        imageUrl: imageUrl ? [{ value: imageUrl, source: 'html:image' }] : [],
-      },
     }
+    pushCandidate(parsed.candidates.title, htmlTitle, 'html:title')
+    pushCandidate(parsed.candidates.description, htmlDescription, 'html:description')
+    pushCandidate(parsed.candidates.imageUrl, imageUrl, 'html:image')
+    addPriceCandidates(parsed, priceText, 'html:price')
+    addPriceCandidates(parsed, visibleText(html), 'html:visible_text')
+    parsed.enrichmentNotes.push('direct_fetch_parsed')
+    return parsed
   } catch {
+    base.enrichmentNotes.push('direct_fetch_failed')
     return base
   }
+}
+
+async function enrichCandidate(candidate: RawCandidate, apiKey: string, params: AiAssistedScrapeParams): Promise<RawCandidate> {
+  const enriched = { ...candidate, candidates: { ...candidate.candidates } }
+  enriched.candidates.title = [...candidate.candidates.title]
+  enriched.candidates.description = [...candidate.candidates.description]
+  enriched.candidates.priceCents = [...candidate.candidates.priceCents]
+  enriched.candidates.imageUrl = [...candidate.candidates.imageUrl]
+
+  if (params.assistMode !== 'normalize' && (!enriched.priceText || !enriched.htmlDescription || !enriched.htmlTitle)) {
+    const organic = await searchSerpApi(supplementalQuery(enriched), apiKey, 3)
+    for (const result of organic) {
+      const snippet = cleanText([result.title, result.snippet].filter(Boolean).join(' - '), 1000)
+      if (!snippet) continue
+      enriched.supplementalSnippets.push(snippet)
+      pushCandidate(enriched.candidates.title, cleanText(result.title, 300), 'serp_enrichment:title')
+      pushCandidate(enriched.candidates.description, cleanText(result.snippet, 1000), 'serp_enrichment:snippet')
+      addPriceCandidates(enriched, result.title, 'serp_enrichment:title')
+      addPriceCandidates(enriched, result.snippet, 'serp_enrichment:snippet')
+    }
+    enriched.enrichmentNotes.push(`serp_text_enrichment_${organic.length}`)
+  }
+
+  if (params.imageEnrichment !== false && !enriched.imageUrl) {
+    const images = await searchSerpApiImages(imageQuery(enriched), apiKey)
+    const exact = images.find(image => image.link && normalizedUrl(image.link) === normalizedUrl(enriched.sourceUrl))
+    const sameSource = images.find(image => image.original && /^(https?:)?\/\//i.test(image.original) && image.source?.toLowerCase().includes(enriched.sourcePlatform.toLowerCase()))
+    const firstUsable = exact ?? sameSource ?? images.find(image => image.original || image.thumbnail)
+    const imageUrl = cleanText(firstUsable?.original ?? firstUsable?.thumbnail, 1000)
+    if (imageUrl) {
+      enriched.imageUrl = imageUrl
+      pushCandidate(enriched.candidates.imageUrl, imageUrl, exact ? 'serp_images:exact_link' : 'serp_images:fallback')
+      enriched.enrichmentNotes.push('image_enriched')
+    } else {
+      enriched.enrichmentNotes.push('image_not_found_after_enrichment')
+    }
+  }
+
+  return enriched
+}
+
+function missingFields(candidate: RawCandidate): string[] {
+  const missing: string[] = []
+  if (!candidate.sourceUrl) missing.push('source_url')
+  if (!candidate.htmlTitle && !candidate.googleTitle && candidate.candidates.title.length === 0) missing.push('title')
+  if (!candidate.htmlDescription && !candidate.googleSnippet && candidate.candidates.description.length === 0) missing.push('description')
+  if (!candidate.priceText && candidate.candidates.priceCents.length === 0) missing.push('price')
+  if (!candidate.imageUrl && candidate.candidates.imageUrl.length === 0) missing.push('image_url')
+  return missing
 }
 
 function fallbackRow(candidate: RawCandidate, params: AiAssistedScrapeParams): GeminiSupplyRow {
   return {
     source_url: candidate.sourceUrl,
-    title: candidate.htmlTitle ?? candidate.googleTitle,
-    description: candidate.htmlDescription ?? candidate.googleSnippet,
-    price: candidate.priceText,
+    title: candidate.htmlTitle ?? candidate.googleTitle ?? candidate.candidates.title[0]?.value?.toString() ?? null,
+    description: candidate.htmlDescription ?? candidate.googleSnippet ?? candidate.supplementalSnippets[0] ?? null,
+    price: candidate.candidates.priceCents[0] ? Number(candidate.candidates.priceCents[0].value) / 100 : candidate.priceText,
     shop_name: candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null,
     location: params.location ?? null,
     state: params.state ?? null,
     municipio: params.municipio ?? null,
-    image_url: candidate.imageUrl,
+    image_url: candidate.imageUrl ?? candidate.candidates.imageUrl[0]?.value?.toString() ?? null,
     category: params.category ?? (candidate.sourcePlatform === 'mercadolibre' ? 'autos' : candidate.sourcePlatform === 'inmuebles24' ? 'inmuebles' : 'otros'),
     listing_type: params.listingType ?? (candidate.sourcePlatform === 'inmuebles24' ? 'rental' : 'product'),
     condition: candidate.sourcePlatform === 'mercadolibre' ? 'good' : null,
     confidence: 35,
+    evidence_summary: 'Deterministic fallback from collected evidence.',
+    missing_fields: missingFields(candidate),
     skip_reason: 'AI normalization failed; deterministic fallback used.',
   }
 }
@@ -339,16 +501,22 @@ async function normalizeWithGemini(candidate: RawCandidate, params: AiAssistedSc
       listing_type: { type: ['string', 'null'], enum: ['product', 'service', 'rental', 'digital', null] },
       condition: { type: ['string', 'null'], enum: ['new', 'like_new', 'good', 'fair', 'parts', null] },
       confidence: { type: ['number', 'null'] },
+      evidence_summary: { type: ['string', 'null'] },
+      missing_fields: { type: ['array', 'null'], items: { type: 'string' } },
       skip_reason: { type: ['string', 'null'] },
     },
-    required: ['source_url', 'title', 'description', 'price', 'shop_name', 'location', 'state', 'municipio', 'image_url', 'category', 'listing_type', 'condition', 'confidence', 'skip_reason'],
+    required: ['source_url', 'title', 'description', 'price', 'shop_name', 'location', 'state', 'municipio', 'image_url', 'category', 'listing_type', 'condition', 'confidence', 'evidence_summary', 'missing_fields', 'skip_reason'],
   }
   const model = process.env.GEMINI_MODEL ?? 'gemini-2.5-flash'
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`
   const prompt = [
-    'Normalize this marketplace evidence into the Miyagi Sanchez supply CSV schema.',
-    'Use only evidence provided. Do not invent a seller name except generic marketplace fallback when the source clearly hides the seller.',
-    'Prices must be MXN pesos, not cents. If unknown, return null.',
+    'You are a strict data extraction and polishing agent for a marketplace supply CSV.',
+    'Your job is not just formatting: choose the best field candidates, recover price/location/detail signals from snippets, and produce a coherent import-ready row.',
+    'Never turn a search/category page into a fake individual listing. If the URL is not an item page, keep source_url but set skip_reason and confidence below 50.',
+    'Use only provided evidence. Do not invent exact prices, images, seller names, addresses, bedrooms, or amenities.',
+    'If evidence includes an image candidate, pick the best direct image URL. If none exists, return null.',
+    'Prices must be normal MXN pesos, not cents. If a price candidate is in cents, divide by 100.',
+    'Description must describe this exact row. Do not borrow a description from a different supplemental result.',
     'Allowed category keys: autos, inmuebles, electronica, hogar, moda, deportes, servicios, mascotas, herramientas, negocios, otros.',
     'Allowed listing_type: product, service, rental, digital.',
     'Cars should be category autos and listing_type product. Real estate rentals should be category inmuebles and listing_type rental.',
@@ -359,6 +527,13 @@ async function normalizeWithGemini(candidate: RawCandidate, params: AiAssistedSc
         state: params.state ?? null,
         municipio: params.municipio ?? null,
         location: params.location ?? null,
+      },
+      expected_schema: ['source_url', 'title', 'description', 'price', 'shop_name', 'location', 'state', 'municipio', 'image_url', 'category', 'listing_type', 'condition'],
+      evidence_quality: {
+        is_item_page: candidate.isItemPage,
+        is_collection_page: candidate.isCollectionPage,
+        missing_before_ai: missingFields(candidate),
+        enrichment_notes: candidate.enrichmentNotes,
       },
       evidence: candidate,
     }),
@@ -373,7 +548,7 @@ async function normalizeWithGemini(candidate: RawCandidate, params: AiAssistedSc
     body: JSON.stringify({
       contents: [{ parts: [{ text: prompt }] }],
       generationConfig: {
-        temperature: 0.1,
+        temperature: 0.05,
         responseMimeType: 'application/json',
         responseJsonSchema: schema,
       },
@@ -397,10 +572,12 @@ function rowToItem(row: GeminiSupplyRow, candidate: RawCandidate, params: AiAssi
   const listingType = cleanText(row.listing_type) ?? params.listingType ?? (candidate.sourcePlatform === 'inmuebles24' ? 'rental' : 'product')
   const condition = cleanText(row.condition)
   const priceCents = parsePriceCents(row.price)
+  const sourceUrl = cleanText(row.source_url, 1000) ?? candidate.sourceUrl
+  const imageUrl = cleanText(row.image_url, 1000) ?? candidate.imageUrl ?? candidate.candidates.imageUrl[0]?.value?.toString() ?? null
 
   return withQuality({
     source_platform: `ai_${candidate.sourcePlatform}`,
-    source_url: cleanText(row.source_url, 1000) ?? candidate.sourceUrl,
+    source_url: sourceUrl,
     shop_name: cleanText(row.shop_name, 200),
     shop_source_url: candidate.sourcePlatform === 'mercadolibre' ? 'https://www.mercadolibre.com.mx' : candidate.sourcePlatform === 'inmuebles24' ? 'https://www.inmuebles24.com' : null,
     listing_title: cleanText(row.title, 200),
@@ -413,20 +590,25 @@ function rowToItem(row: GeminiSupplyRow, candidate: RawCandidate, params: AiAssi
     state: cleanText(row.state, 120) ?? params.state ?? null,
     municipio: cleanText(row.municipio, 120) ?? params.municipio ?? null,
     location: cleanText(row.location, 240) ?? params.location ?? null,
-    image_url: cleanText(row.image_url, 1000) ?? candidate.imageUrl,
+    image_url: imageUrl,
     raw_data: {
       ai_confidence: typeof row.confidence === 'number' ? row.confidence : null,
       ai_skip_reason: cleanText(row.skip_reason, 500),
+      ai_evidence_summary: cleanText(row.evidence_summary, 1000),
+      ai_missing_fields: row.missing_fields ?? missingFields(candidate),
       ai_raw_row: row as unknown as Record<string, unknown>,
       raw_candidate: candidate as unknown as Record<string, unknown>,
-      canonical_url: cleanText(row.source_url, 1000) ?? candidate.sourceUrl,
-      original_link_valid: /^https?:\/\//i.test(cleanText(row.source_url, 1000) ?? candidate.sourceUrl),
+      canonical_url: sourceUrl,
+      original_link_valid: /^https?:\/\//i.test(sourceUrl),
+      item_page_detected: candidate.isItemPage,
+      collection_page_detected: candidate.isCollectionPage,
+      enrichment_notes: candidate.enrichmentNotes,
       candidates: candidate.candidates,
     },
   }, {
     parserName: 'ai_assisted_gemini',
     parserStatus: parserNotes.length > 0 ? 'ai_fallback' : 'ai_normalized',
-    parserAttempts: ['serpapi_google_search', candidate.fetchStatus, 'gemini_structured_output'],
+    parserAttempts: ['serpapi_google_search', candidate.fetchStatus, 'serpapi_missing_field_enrichment', 'serpapi_image_enrichment', 'gemini_structured_output'],
     parserNotes,
   })
 }
@@ -440,6 +622,11 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   const limit = Math.max(1, Math.min(50, params.limit ?? 20))
   const inputMode = params.inputMode ?? 'search'
   const targetSite = params.targetSite ?? 'mercadolibre'
+  const strictItemPages = params.strictItemPages !== false
+  const stageLog: string[] = [
+    `Input prepared: ${inputMode} / ${targetSite} / limit ${limit}.`,
+    'SerpAPI discovery started with item-page-biased queries.',
+  ]
   const seeds = inputMode === 'search'
     ? [params.query?.trim()].filter((value): value is string => !!value)
     : splitUrls(params.urls || params.query)
@@ -451,27 +638,50 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
 
   for (const seed of seeds) {
     const query = queryForSeed(seed, targetSite, inputMode)
-    const perSeedLimit = Math.max(1, Math.ceil(limit / seeds.length))
+    const perSeedLimit = Math.max(1, Math.ceil(limit / seeds.length) * (strictItemPages ? 2 : 1))
     const results = await searchSerpApi(query, serpApiKey, perSeedLimit)
+    stageLog.push(`SerpAPI query returned ${results.length} candidates: ${query}`)
     for (const result of results) {
       if (!result.link || seenLinks.has(result.link)) continue
       seenLinks.add(result.link)
       rawResults.push(result)
-      if (rawResults.length >= limit) break
+      if (rawResults.length >= limit * 2) break
     }
-    if (rawResults.length >= limit) break
+    if (rawResults.length >= limit * 2) break
   }
 
+  stageLog.push(`Fetched ${rawResults.length} discovery candidates; extracting page evidence next.`)
   let failed = 0
-  const candidates: RawCandidate[] = []
+  const fetchedCandidates: RawCandidate[] = []
   for (let i = 0; i < rawResults.length; i += 4) {
     const batch = rawResults.slice(i, i + 4)
     const batchCandidates = await Promise.all(batch.map(result => fetchEvidence(result, seeds[0] ?? '', targetSite)))
-    candidates.push(...batchCandidates.filter((item): item is RawCandidate => item !== null))
+    fetchedCandidates.push(...batchCandidates.filter((item): item is RawCandidate => item !== null))
   }
 
+  const itemCandidates = strictItemPages
+    ? fetchedCandidates.filter(candidate => candidate.isItemPage)
+    : fetchedCandidates.filter(candidate => !candidate.isCollectionPage)
+  const candidatesToEnrich = itemCandidates.slice(0, limit)
+  const skippedCollectionPages = fetchedCandidates.length - candidatesToEnrich.length
+  stageLog.push(`Evidence cleanup kept ${candidatesToEnrich.length} item-level rows and filtered ${Math.max(0, skippedCollectionPages)} weak/search pages.`)
+
+  const enrichedCandidates: RawCandidate[] = []
+  for (const candidate of candidatesToEnrich) {
+    const before = missingFields(candidate)
+    const enriched = await enrichCandidate(candidate, serpApiKey, params)
+    const after = missingFields(enriched)
+    enriched.enrichmentNotes.push(`missing_before:${before.join('|') || 'none'}`)
+    enriched.enrichmentNotes.push(`missing_after:${after.join('|') || 'none'}`)
+    enrichedCandidates.push(enriched)
+  }
+  const imageCount = enrichedCandidates.filter(candidate => candidate.imageUrl || candidate.candidates.imageUrl.length > 0).length
+  const priceCount = enrichedCandidates.filter(candidate => candidate.priceText || candidate.candidates.priceCents.length > 0).length
+  stageLog.push(`Missing-field enrichment complete: ${priceCount}/${enrichedCandidates.length} have price evidence, ${imageCount}/${enrichedCandidates.length} have image evidence.`)
+  stageLog.push('Gemini validation and schema polishing started item by item.')
+
   const items: ScrapeCollectedItem[] = []
-  for (const candidate of candidates) {
+  for (const candidate of enrichedCandidates) {
     const notes: string[] = []
     let row: GeminiSupplyRow
     try {
@@ -484,17 +694,23 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
     items.push(rowToItem(row, candidate, params, notes))
   }
 
+  stageLog.push(`Gemini output cleanup finished: ${items.length} rows ready for review/export, ${failed} AI fallback rows.`)
+  const stats = summarizeCollectedItems(items, {
+    fetched: rawResults.length,
+    parsed: items.length,
+    failed,
+    duplicates: Math.max(0, rawResults.length - fetchedCandidates.length),
+    invalid: Math.max(0, skippedCollectionPages),
+    autoSkipped: Math.max(0, skippedCollectionPages),
+  })
+
   return {
     items,
-    skipped: 0,
+    skipped: Math.max(0, skippedCollectionPages),
     errors: failed,
-    stats: summarizeCollectedItems(items, {
-      fetched: rawResults.length,
-      parsed: items.length,
-      failed,
-      duplicates: Math.max(0, rawResults.length - candidates.length),
-      invalid: 0,
-      autoSkipped: 0,
-    }),
+    stats: {
+      ...stats,
+      stageLog,
+    },
   }
 }

@@ -75,6 +75,7 @@ interface RunResult {
     invalid: number
     autoSkipped: number
     avgQuality: number
+    stageLog?: string[]
   }
 }
 
@@ -567,9 +568,20 @@ function ValidationTable({
 
 function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: RunResult | null; loading: boolean; secret: string; sourceLabelStr: string }) {
   if (loading) return (
-    <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 6, backgroundColor: '#f0f9ff', border: '1px solid #bae6fd', fontSize: 14, display: 'flex', alignItems: 'center', gap: 8 }}>
-      <Spinner color="#0369a1" />
-      <span style={{ color: '#0369a1' }}>Scraping in progress…</span>
+    <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 6, backgroundColor: '#f0f9ff', border: '1px solid #bae6fd', fontSize: 14 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <Spinner color="#0369a1" />
+        <span style={{ color: '#0369a1' }}>Scraping in progress…</span>
+      </div>
+      {sourceLabelStr === 'ai_assisted' && (
+        <div style={{ marginTop: 8, display: 'grid', gap: 3, color: '#075985', fontSize: 12 }}>
+          <span>Fetching candidates with SerpAPI</span>
+          <span>Filtering weak search/category pages</span>
+          <span>Enriching missing prices and images</span>
+          <span>Validating and polishing each row with Gemini</span>
+          <span>Cleaning output for supply CSV export</span>
+        </div>
+      )}
     </div>
   )
   if (!result) return null
@@ -613,6 +625,16 @@ function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: Run
                 <span>Filtered links {result.stats.duplicates + result.stats.invalid}</span>
               )}
             </div>
+          )}
+          {result.stats?.stageLog && result.stats.stageLog.length > 0 && (
+            <details open style={{ marginTop: 10 }}>
+              <summary style={{ cursor: 'pointer', color: '#166534', fontSize: 12, fontWeight: 700 }}>Run details</summary>
+              <div style={{ marginTop: 6, display: 'grid', gap: 4, color: '#475569', fontSize: 12 }}>
+                {result.stats.stageLog.map((entry, index) => (
+                  <span key={`${index}-${entry}`}>{entry}</span>
+                ))}
+              </div>
+            </details>
           )}
         </div>
       )}
@@ -673,6 +695,9 @@ interface AiAssistedFormState {
   targetSite: string
   category: string
   listingType: 'product' | 'service' | 'rental' | 'digital'
+  assistMode: 'normalize' | 'enrich'
+  imageEnrichment: boolean
+  strictItemPages: boolean
   location: string
   state: string
   municipio: string
@@ -739,6 +764,9 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     targetSite: 'mercadolibre',
     category: 'autos',
     listingType: 'product',
+    assistMode: 'enrich',
+    imageEnrichment: true,
+    strictItemPages: true,
     location: 'Ciudad de México, Mexico',
     state: 'Ciudad de México',
     municipio: '',
@@ -914,6 +942,9 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       targetSite: aiForm.targetSite,
       category: aiForm.category,
       listingType: aiForm.listingType,
+      assistMode: aiForm.assistMode,
+      imageEnrichment: aiForm.imageEnrichment,
+      strictItemPages: aiForm.strictItemPages,
       location: aiForm.location,
       state: aiForm.state,
       municipio: aiForm.municipio,
@@ -1312,6 +1343,33 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                   <option value="service">service</option>
                   <option value="digital">digital</option>
                 </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Gemini Assist Mode</label>
+                <select style={input} value={aiForm.assistMode} onChange={e => setAiForm(f => ({ ...f, assistMode: e.target.value as AiAssistedFormState['assistMode'] }))}>
+                  <option value="enrich">Enrich missing fields</option>
+                  <option value="normalize">Normalize only</option>
+                </select>
+                <p style={hint}>Enrich uses extra SerpAPI lookups before Gemini validation.</p>
+              </div>
+              <div style={{ ...field, display: 'grid', gap: 8, alignContent: 'start' }}>
+                <label style={label}>AI Evidence Controls</label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#374151' }}>
+                  <input
+                    type="checkbox"
+                    checked={aiForm.imageEnrichment}
+                    onChange={e => setAiForm(f => ({ ...f, imageEnrichment: e.target.checked }))}
+                  />
+                  Recover missing images with SerpAPI Images
+                </label>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: '#374151' }}>
+                  <input
+                    type="checkbox"
+                    checked={aiForm.strictItemPages}
+                    onChange={e => setAiForm(f => ({ ...f, strictItemPages: e.target.checked }))}
+                  />
+                  Keep only item-level pages
+                </label>
               </div>
               <div style={field}>
                 <label style={label}>Location</label>
