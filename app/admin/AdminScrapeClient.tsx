@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { CATEGORIES, TARGET_SEARCH_SITES } from '@/lib/types'
 
 /* ── Types ───────────────────────────────────────────── */
@@ -205,6 +205,39 @@ function downloadCsv(csvData: string, filename: string) {
   URL.revokeObjectURL(url)
 }
 
+async function clipboardImageOrText(): Promise<string | null> {
+  try {
+    const text = await navigator.clipboard.readText()
+    if (/^(https?:|data:image\/)/i.test(text.trim())) return text.trim()
+  } catch {}
+
+  try {
+    const items = await navigator.clipboard.read()
+    for (const item of items) {
+      const imageType = item.types.find(type => type.startsWith('image/'))
+      if (!imageType) continue
+      const blob = await item.getType(imageType)
+      return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader()
+        reader.onload = () => resolve(String(reader.result ?? ''))
+        reader.onerror = () => reject(reader.error)
+        reader.readAsDataURL(blob)
+      })
+    }
+  } catch {}
+
+  return null
+}
+
+function fileToDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result ?? ''))
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
 function StatusBadge({ status }: { status: string }) {
   const map: Record<string, { bg: string; color: string }> = {
     running:   { bg: '#fef08a', color: '#713f12' },
@@ -378,6 +411,75 @@ function CandidatePicker({
   )
 }
 
+function ImageEditor({
+  value,
+  candidates,
+  onChange,
+}: {
+  value: string
+  candidates: FieldCandidate[]
+  onChange: (value: string) => void
+}) {
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
+
+  async function pasteImage() {
+    const next = await clipboardImageOrText()
+    if (next) onChange(next)
+  }
+
+  async function uploadImage(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+    onChange(await fileToDataUrl(file))
+    e.target.value = ''
+  }
+
+  return (
+    <div style={{ display: 'grid', gap: 8 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: value ? '180px 1fr' : '1fr', gap: 12, alignItems: 'start' }}>
+        {value && (
+          <a href={value} target="_blank" rel="noopener noreferrer" title="Open image in a new tab">
+            <img
+              src={value}
+              alt="preview"
+              style={{ width: 180, height: 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover', backgroundColor: '#f8fafc' }}
+              onError={e => { (e.target as HTMLImageElement).style.opacity = '0.35' }}
+            />
+          </a>
+        )}
+        <div style={{ display: 'grid', gap: 6 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <span style={{ fontSize: 11, fontWeight: 600, color: '#6b7280' }}>Image URL</span>
+            <CandidatePicker
+              field="Image"
+              currentValue={value}
+              candidates={candidates}
+              onSelect={onChange}
+            />
+          </div>
+          <input
+            type="text"
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            placeholder="https://..."
+            style={{
+              width: '100%', padding: '4px 6px', border: '1px solid #e5e7eb',
+              borderRadius: 4, fontSize: 12, boxSizing: 'border-box',
+              backgroundColor: '#fff', fontFamily: 'inherit',
+            }}
+          />
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" onClick={() => { void pasteImage() }} style={{ padding: '5px 9px', borderRadius: 5, border: '1px solid #d1d5db', backgroundColor: '#fff', cursor: 'pointer', fontSize: 12 }}>Paste</button>
+            <button type="button" onClick={() => fileInputRef.current?.click()} style={{ padding: '5px 9px', borderRadius: 5, border: '1px solid #d1d5db', backgroundColor: '#fff', cursor: 'pointer', fontSize: 12 }}>Upload</button>
+            <input ref={fileInputRef} type="file" accept="image/*" onChange={e => { void uploadImage(e) }} style={{ display: 'none' }} />
+            <button type="button" onClick={() => onChange('')} style={{ padding: '5px 9px', borderRadius: 5, border: '1px solid #fecaca', backgroundColor: '#fff', color: '#b91c1c', cursor: 'pointer', fontSize: 12 }}>Remove</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 /* ── Validation Table Component ──────────────────────── */
 
 function ValidationTable({
@@ -396,15 +498,18 @@ function ValidationTable({
   const [expandedRow, setExpandedRow] = useState<number | null>(null)
   const includedCount = items.filter(i => i._included).length
 
-  const editableFields: Array<{ key: keyof EditableItem; label: string; candidateKey?: keyof EditableItem['candidates'] }> = [
+  const editableFields: Array<{ key: keyof EditableItem; label: string; candidateKey?: keyof EditableItem['candidates']; long?: boolean }> = [
+    { key: 'source_url', label: 'Source URL', long: true },
     { key: 'title', label: 'Title', candidateKey: 'title' },
     { key: 'description', label: 'Description', candidateKey: 'description' },
     { key: 'price', label: 'Price', candidateKey: 'priceCents' },
-    { key: 'image_url', label: 'Image', candidateKey: 'imageUrl' },
     { key: 'shop_name', label: 'Shop' },
     { key: 'location', label: 'Location' },
     { key: 'state', label: 'State' },
+    { key: 'municipio', label: 'Municipio' },
     { key: 'category', label: 'Category' },
+    { key: 'listing_type', label: 'Listing Type' },
+    { key: 'condition', label: 'Condition' },
   ]
 
   const cellInput: React.CSSProperties = {
@@ -543,26 +648,20 @@ function ValidationTable({
                       </div>
                     )}
 
-                    {/* Image preview */}
-                    {item.image_url && (
-                      <div style={{ marginBottom: 10 }}>
-                        <a href={item.image_url} target="_blank" rel="noopener noreferrer" title="Open image in a new tab">
-                          <img
-                            src={item.image_url}
-                            alt="preview"
-                            style={{ maxWidth: 180, maxHeight: 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover' }}
-                            onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
-                          />
-                        </a>
-                      </div>
-                    )}
+                    <div style={{ marginBottom: 12 }}>
+                      <ImageEditor
+                        value={item.image_url}
+                        candidates={item.candidates.imageUrl}
+                        onChange={value => onUpdate(idx, 'image_url', value)}
+                      />
+                    </div>
 
                     {/* Editable fields grid */}
                     <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px' }}>
-                      {editableFields.map(({ key, label, candidateKey }) => {
+                      {editableFields.map(({ key, label, candidateKey, long }) => {
                         const candidates = candidateKey ? item.candidates[candidateKey] : []
                         const value = String(item[key] ?? '')
-                        const isLongField = key === 'description'
+                        const isLongField = long || key === 'description'
 
                         return (
                           <div key={key} style={isLongField ? { gridColumn: '1 / -1' } : {}}>
@@ -975,7 +1074,6 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       csvData: csv,
       isLocal: true,
     })
-    setValidatingItems(null)
     void fetchRuns()
   }
 
