@@ -33,6 +33,7 @@ export interface AiAssistedScrapeParams {
   maxSerpRequests?: number
   maxRuntimeMs?: number
   onProgress?: (event: AiProgressEvent) => void | Promise<void>
+  onItem?: (item: ScrapeCollectedItem, index: number, total: number) => void | Promise<void>
 }
 
 interface SerpOrganicResult {
@@ -838,7 +839,9 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
     const candidate = enrichedCandidates[index]
     if (params.assistMode === 'url_image') {
       await progress(params, { phase: 'csv', message: `Preparing URL/image row (${index + 1}/${enrichedCandidates.length})`, percent: 72 + Math.round((index / Math.max(1, enrichedCandidates.length)) * 23), current: index + 1, total: enrichedCandidates.length, itemLabel: candidate.googleTitle ?? candidate.sourceUrl })
-      items.push(urlImageItem(candidate, params))
+      const item = urlImageItem(candidate, params)
+      items.push(item)
+      await params.onItem?.(item, items.length, enrichedCandidates.length)
       continue
     }
     const notes: string[] = []
@@ -851,7 +854,9 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
       notes.push(String(error).slice(0, 160))
       row = fallbackRow(candidate, params)
     }
-    items.push(rowToItem(row, candidate, params, notes))
+    const item = rowToItem(row, candidate, params, notes)
+    items.push(item)
+    await params.onItem?.(item, items.length, enrichedCandidates.length)
   }
 
   stageLog.push(`Gemini output cleanup finished: ${items.length} rows ready for review/export, ${failed} AI fallback rows.`)

@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { collectAiAssistedScrape, type AiProgressEvent } from '@/lib/scrapers/aiAssisted'
 import { supplyItemsToCsv } from '@/lib/adminScrapeExport'
+import type { ScrapeCollectedItem } from '@/lib/adminScrapeExport'
 import type { TargetSearchSiteKey } from '@/lib/types'
 
 function checkSecret(req: NextRequest): boolean {
@@ -13,7 +14,11 @@ function checkSecret(req: NextRequest): boolean {
 }
 
 function send(controller: ReadableStreamDefaultController<Uint8Array>, event: string, data: unknown) {
-  controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ event, data })}\n`))
+  try {
+    controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ event, data })}\n`))
+  } catch {
+    // Client intentionally paused/cancelled the stream.
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -56,6 +61,9 @@ export async function POST(req: NextRequest) {
           onProgress: async (event: AiProgressEvent) => {
             send(controller, 'progress', event)
           },
+          onItem: async (item: ScrapeCollectedItem, index: number, total: number) => {
+            send(controller, 'item', { item, index, total })
+          },
         })
 
         send(controller, 'result', {
@@ -72,7 +80,9 @@ export async function POST(req: NextRequest) {
       } catch (error) {
         send(controller, 'error', { error: String(error) })
       } finally {
-        controller.close()
+        try {
+          controller.close()
+        } catch {}
       }
     },
   })

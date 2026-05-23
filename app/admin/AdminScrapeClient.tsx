@@ -89,6 +89,12 @@ interface AiProgressState {
   log: string[]
 }
 
+interface AiStreamItemEvent {
+  item: ScrapeItem
+  index: number
+  total: number
+}
+
 /* ── Editable row for validation ────────────────────── */
 
 interface EditableItem {
@@ -488,15 +494,28 @@ function ValidationTable({
   onExport,
   onCancel,
   sourceName,
+  progress,
+  isRunning = false,
+  isPaused = false,
+  onPause,
+  onResume,
+  onStop,
 }: {
   items: EditableItem[]
   onUpdate: (idx: number, field: keyof EditableItem, value: string | boolean) => void
   onExport: () => void
   onCancel: () => void
   sourceName: string
+  progress?: AiProgressState | null
+  isRunning?: boolean
+  isPaused?: boolean
+  onPause?: () => void
+  onResume?: () => void
+  onStop?: () => void
 }) {
   const [expandedRow, setExpandedRow] = useState<number | null>(null)
   const includedCount = items.filter(i => i._included).length
+  const showLiveControls = Boolean(progress || isRunning || isPaused || onPause || onResume || onStop)
 
   const editableFields: Array<{ key: keyof EditableItem; label: string; candidateKey?: keyof EditableItem['candidates']; long?: boolean }> = [
     { key: 'source_url', label: 'Source URL', long: true },
@@ -534,39 +553,88 @@ function ValidationTable({
         {/* Header */}
         <div style={{
           padding: '16px 24px', borderBottom: '1px solid #e5e7eb',
-          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          display: 'grid', gap: 12,
           background: 'linear-gradient(to right, #f8fafc, #eef2ff)',
         }}>
-          <div>
-            <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: '#111827' }}>
-              📋 Validate Scraped Data
-            </h2>
-            <p style={{ margin: '4px 0 0', fontSize: 13, color: '#6b7280' }}>
-              {includedCount} of {items.length} items included · {sourceName}
-              {' · '}Click <span style={{ color: '#6366f1', fontWeight: 600 }}>⬡</span> to see alternative candidates from different parsers
-            </p>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 18 }}>
+            <div>
+              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: '#111827' }}>
+                📋 Validate Scraped Data
+              </h2>
+              <p style={{ margin: '4px 0 0', fontSize: 13, color: '#6b7280' }}>
+                {includedCount} of {items.length} items included · {sourceName}
+                {' · '}Click <span style={{ color: '#6366f1', fontWeight: 600 }}>⬡</span> to see alternative candidates from different parsers
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              {isRunning && onPause && (
+                <button type="button" onClick={onPause} style={{
+                  padding: '8px 14px', borderRadius: 6, border: '1px solid #f59e0b',
+                  backgroundColor: '#fffbeb', color: '#92400e', fontSize: 13,
+                  fontWeight: 700, cursor: 'pointer',
+                }}>Pause</button>
+              )}
+              {isPaused && onResume && (
+                <button type="button" onClick={onResume} style={{
+                  padding: '8px 14px', borderRadius: 6, border: '1px solid #0d9488',
+                  backgroundColor: '#f0fdfa', color: '#0f766e', fontSize: 13,
+                  fontWeight: 700, cursor: 'pointer',
+                }}>Resume</button>
+              )}
+              {(isRunning || isPaused) && onStop && (
+                <button type="button" onClick={onStop} style={{
+                  padding: '8px 14px', borderRadius: 6, border: '1px solid #fecaca',
+                  backgroundColor: '#fff', color: '#b91c1c', fontSize: 13,
+                  fontWeight: 700, cursor: 'pointer',
+                }}>Cancel Run</button>
+              )}
+              <button type="button" onClick={() => {
+                if (window.confirm('Discard these scraped results? Export or keep reviewing if you still need them.')) onCancel()
+              }} style={{
+                padding: '8px 18px', borderRadius: 6, border: '1px solid #d1d5db',
+                backgroundColor: '#fff', color: '#374151', fontSize: 13,
+                fontWeight: 600, cursor: 'pointer',
+              }}>Discard</button>
+              <button type="button" onClick={onExport} style={{
+                padding: '8px 22px', borderRadius: 6, border: 'none',
+                background: 'linear-gradient(135deg, #4f46e5, #6366f1)',
+                color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer',
+                boxShadow: '0 2px 8px rgba(99,102,241,0.35)',
+              }}>
+                ✦ Export CSV ({includedCount} rows)
+              </button>
+            </div>
           </div>
-          <div style={{ display: 'flex', gap: 10 }}>
-            <button onClick={() => {
-              if (window.confirm('Discard these scraped results? Export or keep reviewing if you still need them.')) onCancel()
-            }} style={{
-              padding: '8px 18px', borderRadius: 6, border: '1px solid #d1d5db',
-              backgroundColor: '#fff', color: '#374151', fontSize: 13,
-              fontWeight: 600, cursor: 'pointer',
-            }}>Discard</button>
-            <button onClick={onExport} style={{
-              padding: '8px 22px', borderRadius: 6, border: 'none',
-              background: 'linear-gradient(135deg, #4f46e5, #6366f1)',
-              color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer',
-              boxShadow: '0 2px 8px rgba(99,102,241,0.35)',
-            }}>
-              ✦ Export CSV ({includedCount} rows)
-            </button>
-          </div>
+
+          {showLiveControls && (
+            <div style={{ display: 'grid', gap: 6, padding: 10, borderRadius: 8, backgroundColor: '#fff', border: '1px solid #e5e7eb' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 12, color: '#475569', flexWrap: 'wrap' }}>
+                <span style={{ fontWeight: 700, color: isPaused ? '#92400e' : isRunning ? '#0369a1' : '#334155' }}>
+                  {isPaused ? 'Paused' : isRunning ? 'Scraping live' : 'Review ready'}
+                </span>
+                {progress && <span>{Math.round(progress.percent)}% · {progress.message}</span>}
+                {progress?.current && progress?.total && <span>Item {progress.current}/{progress.total}</span>}
+              </div>
+              <div style={{ height: 8, backgroundColor: '#e2e8f0', borderRadius: 999, overflow: 'hidden' }}>
+                <div style={{ width: `${Math.max(1, Math.min(100, progress?.percent ?? (items.length ? 100 : 2)))}%`, height: '100%', backgroundColor: isPaused ? '#f59e0b' : '#0ea5e9', transition: 'width 0.2s ease' }} />
+              </div>
+              {progress?.itemLabel && <div style={{ fontSize: 12, color: '#64748b', wordBreak: 'break-word' }}>Working on: {progress.itemLabel}</div>}
+              {progress?.log?.length ? (
+                <div style={{ display: 'grid', gap: 2, fontSize: 11, color: '#64748b' }}>
+                  {progress.log.slice(-4).map((entry, index) => <span key={`${index}-${entry}`}>{entry}</span>)}
+                </div>
+              ) : null}
+            </div>
+          )}
         </div>
 
         {/* Table body */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px' }}>
+          {items.length === 0 && (
+            <div style={{ margin: 16, padding: 18, border: '1px dashed #cbd5e1', borderRadius: 8, backgroundColor: '#f8fafc', color: '#475569', fontSize: 13 }}>
+              Rows will appear here as soon as the scraper validates each listing. You can pause or cancel the run and keep anything already captured.
+            </div>
+          )}
           {items.map((item, idx) => {
             const isExpanded = expandedRow === idx
             const hasAnyCandidates = Object.values(item.candidates).some(c => c.length > 0)
@@ -862,6 +930,10 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   // Validation state
   const [validatingItems, setValidatingItems] = useState<EditableItem[] | null>(null)
   const [validationSource, setValidationSource] = useState('')
+  const aiAbortRef = useRef<AbortController | null>(null)
+  const aiAbortReasonRef = useRef<'pause' | 'cancel' | null>(null)
+  const [aiPaused, setAiPaused] = useState(false)
+  const [lastAiParams, setLastAiParams] = useState<Record<string, unknown> | null>(null)
 
   const [serpForm, setSerpForm] = useState<SerpApiFormState>({
     query: '',
@@ -1055,6 +1127,22 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     })
   }
 
+  function appendAiWorkbenchItem(item: ScrapeItem) {
+    setValidationSource('ai_assisted_scrape')
+    setValidatingItems(prev => {
+      const existing = prev ?? []
+      const incomingUrl = (item.source_url ?? '').trim().toLowerCase()
+      const incomingFallback = `${item.listing_title ?? ''}|${item.image_url ?? ''}`.trim().toLowerCase()
+      const alreadyExists = existing.some(row => {
+        const rowUrl = row.source_url.trim().toLowerCase()
+        if (incomingUrl && rowUrl === incomingUrl) return true
+        return !incomingUrl && incomingFallback && `${row.title}|${row.image_url}`.trim().toLowerCase() === incomingFallback
+      })
+      if (alreadyExists) return existing
+      return [...existing, scrapeItemToEditable(item, existing.length)]
+    })
+  }
+
   function handleValidationExport() {
     if (!validatingItems) return
     const csv = editableItemsToCsv(validatingItems)
@@ -1079,32 +1167,43 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
 
   /* ── Scrape handlers ─────────────────────────────── */
 
-  async function runAiAssisted(e: React.FormEvent) {
-    e.preventDefault()
+  function updateAiProgress(message: string, phase: string, percent?: number) {
+    setAiProgress(prev => {
+      const next = {
+        phase,
+        message,
+        percent: percent ?? prev?.percent ?? 1,
+        current: prev?.current,
+        total: prev?.total,
+        itemLabel: prev?.itemLabel,
+        log: [...(prev?.log ?? []), message].slice(-12),
+      }
+      return next
+    })
+  }
+
+  async function runAiAssistedStream(params: Record<string, unknown>, resetWorkbench: boolean) {
     setAiLoading(true)
+    setAiPaused(false)
     setAiResult(null)
-    setAiProgress({ phase: 'input', message: 'Preparing AI-assisted scrape', percent: 1, log: ['Preparing AI-assisted scrape'] })
-    const params = {
-      inputMode: aiForm.inputMode,
-      query: aiForm.query,
-      urls: aiForm.urls,
-      targetSite: aiForm.targetSite,
-      category: aiForm.category,
-      listingType: aiForm.listingType,
-      assistMode: aiForm.assistMode,
-      imageEnrichment: aiForm.imageEnrichment,
-      strictItemPages: aiForm.strictItemPages,
-      maxSerpRequests: Number(aiForm.maxSerpRequests),
-      maxRuntimeMs: Number(aiForm.maxRuntimeSeconds) * 1000,
-      location: aiForm.location,
-      state: aiForm.state,
-      municipio: aiForm.municipio,
-      limit: Number(aiForm.limit),
+    aiAbortReasonRef.current = null
+    const controller = new AbortController()
+    aiAbortRef.current = controller
+
+    if (resetWorkbench) {
+      setValidationSource('ai_assisted_scrape')
+      setValidatingItems([])
+      setLastAiParams(params)
+      setAiProgress({ phase: 'input', message: 'Preparing AI-assisted scrape', percent: 1, log: ['Preparing AI-assisted scrape'] })
+    } else {
+      updateAiProgress('Resuming AI-assisted scrape; existing rows stay in the workbench', 'input', 1)
     }
+
     try {
       const res = await fetch('/api/admin/scrape/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
+        signal: controller.signal,
         body: JSON.stringify({
           params,
           apiKey,
@@ -1130,13 +1229,16 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
         buffer = lines.pop() ?? ''
         for (const line of lines) {
           if (!line.trim()) continue
-          const packet = JSON.parse(line) as { event: string; data: AiProgressState | RunResult }
+          const packet = JSON.parse(line) as { event: string; data: AiProgressState | RunResult | AiStreamItemEvent }
           if (packet.event === 'progress') {
             const event = packet.data as AiProgressState
             setAiProgress(prev => ({
               ...event,
               log: [...(prev?.log ?? []), event.message].slice(-12),
             }))
+          } else if (packet.event === 'item') {
+            const event = packet.data as AiStreamItemEvent
+            appendAiWorkbenchItem(event.item)
           } else if (packet.event === 'result') {
             finalResult = packet.data as RunResult
             setAiResult(finalResult)
@@ -1148,14 +1250,84 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       }
 
       if (finalResult) {
-        handleScrapeResult(finalResult, 'ai_assisted_scrape', params)
+        finalResult.items?.forEach(item => appendAiWorkbenchItem(item))
+        if (!finalResult.error && finalResult.csvData) {
+          saveLocalRun({
+            id: finalResult.runId || `local-${Date.now()}`,
+            source: 'ai_assisted_scrape',
+            params,
+            status: 'completed',
+            count_inserted: finalResult.inserted || finalResult.collected || 0,
+            count_skipped: finalResult.skipped || 0,
+            count_errors: finalResult.errors || 0,
+            error_message: null,
+            started_at: new Date().toISOString(),
+            completed_at: new Date().toISOString(),
+            csvData: finalResult.csvData,
+            isLocal: true,
+          })
+        }
       }
       await fetchRuns()
     } catch (err) {
-      setAiResult({ error: String(err) })
+      const isAbort = err instanceof DOMException && err.name === 'AbortError'
+      if (isAbort && aiAbortReasonRef.current === 'pause') {
+        setAiPaused(true)
+        updateAiProgress('Paused; rows already captured are kept in the workbench', 'paused')
+      } else if (isAbort && aiAbortReasonRef.current === 'cancel') {
+        setAiPaused(false)
+        updateAiProgress('Cancelled; captured rows are still available for review/export', 'cancelled')
+      } else {
+        setAiResult({ error: String(err) })
+        updateAiProgress('Scrape stopped with an error; captured rows are still available', 'warning')
+      }
     } finally {
+      if (aiAbortRef.current === controller) aiAbortRef.current = null
       setAiLoading(false)
     }
+  }
+
+  async function runAiAssisted(e: React.FormEvent) {
+    e.preventDefault()
+    const params = {
+      inputMode: aiForm.inputMode,
+      query: aiForm.query,
+      urls: aiForm.urls,
+      targetSite: aiForm.targetSite,
+      category: aiForm.category,
+      listingType: aiForm.listingType,
+      assistMode: aiForm.assistMode,
+      imageEnrichment: aiForm.imageEnrichment,
+      strictItemPages: aiForm.strictItemPages,
+      maxSerpRequests: Number(aiForm.maxSerpRequests),
+      maxRuntimeMs: Number(aiForm.maxRuntimeSeconds) * 1000,
+      location: aiForm.location,
+      state: aiForm.state,
+      municipio: aiForm.municipio,
+      limit: Number(aiForm.limit),
+    }
+    await runAiAssistedStream(params, true)
+  }
+
+  function pauseAiAssisted() {
+    if (!aiAbortRef.current) return
+    aiAbortReasonRef.current = 'pause'
+    aiAbortRef.current.abort()
+  }
+
+  function cancelAiAssisted() {
+    if (!aiAbortRef.current) {
+      setAiPaused(false)
+      updateAiProgress('Cancelled; captured rows are still available for review/export', 'cancelled')
+      return
+    }
+    aiAbortReasonRef.current = 'cancel'
+    aiAbortRef.current.abort()
+  }
+
+  async function resumeAiAssisted() {
+    if (!lastAiParams || aiLoading) return
+    await runAiAssistedStream(lastAiParams, false)
   }
 
   async function runSerpApi(e: React.FormEvent) {
@@ -1338,6 +1510,12 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
           onExport={handleValidationExport}
           onCancel={() => setValidatingItems(null)}
           sourceName={sourceLabel(validationSource)}
+          progress={validationSource === 'ai_assisted_scrape' ? aiProgress : null}
+          isRunning={validationSource === 'ai_assisted_scrape' && aiLoading}
+          isPaused={validationSource === 'ai_assisted_scrape' && aiPaused}
+          onPause={validationSource === 'ai_assisted_scrape' ? pauseAiAssisted : undefined}
+          onResume={validationSource === 'ai_assisted_scrape' ? () => { void resumeAiAssisted() } : undefined}
+          onStop={validationSource === 'ai_assisted_scrape' ? cancelAiAssisted : undefined}
         />
       )}
 
