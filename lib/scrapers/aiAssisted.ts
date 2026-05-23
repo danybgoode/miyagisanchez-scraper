@@ -3,7 +3,16 @@ import { TARGET_SEARCH_SITES, type TargetSearchSiteKey } from '../types'
 import { summarizeCollectedItems, withQuality } from './quality'
 
 type InputMode = 'search' | 'urls' | 'mercadolibre_seller' | 'inmuebles24_search'
-type AssistMode = 'normalize' | 'enrich'
+type AssistMode = 'normalize' | 'enrich' | 'url_image'
+
+export interface AiProgressEvent {
+  phase: 'input' | 'serpapi' | 'cleanup' | 'enrichment' | 'gemini' | 'csv' | 'done' | 'warning'
+  message: string
+  percent: number
+  current?: number
+  total?: number
+  itemLabel?: string
+}
 
 export interface AiAssistedScrapeParams {
   inputMode?: InputMode
@@ -21,6 +30,9 @@ export interface AiAssistedScrapeParams {
   assistMode?: AssistMode
   imageEnrichment?: boolean
   strictItemPages?: boolean
+  maxSerpRequests?: number
+  maxRuntimeMs?: number
+  onProgress?: (event: AiProgressEvent) => void | Promise<void>
 }
 
 interface SerpOrganicResult {
@@ -86,6 +98,34 @@ const TARGET_SITE_MAP = Object.fromEntries(TARGET_SEARCH_SITES.map(site => [site
 const CATEGORY_KEYS = new Set(['autos', 'inmuebles', 'electronica', 'hogar', 'moda', 'deportes', 'servicios', 'mascotas', 'herramientas', 'negocios', 'otros'])
 const LISTING_TYPES = new Set(['product', 'service', 'rental', 'digital'])
 const CONDITIONS = new Set(['new', 'like_new', 'good', 'fair', 'parts'])
+
+class RunBudget {
+  private startedAt = Date.now()
+  private serpRequests = 0
+
+  constructor(
+    private maxSerpRequests: number,
+    private maxRuntimeMs: number,
+  ) {}
+
+  check() {
+    if (Date.now() - this.startedAt > this.maxRuntimeMs) {
+      throw new Error(`AI-assisted scrape stopped after ${Math.round(this.maxRuntimeMs / 1000)}s runtime guard`)
+    }
+  }
+
+  useSerpRequest() {
+    this.check()
+    this.serpRequests++
+    if (this.serpRequests > this.maxSerpRequests) {
+      throw new Error(`AI-assisted scrape stopped after ${this.maxSerpRequests} SerpAPI request guard`)
+    }
+  }
+}
+
+async function progress(params: AiAssistedScrapeParams, event: AiProgressEvent) {
+  await params.onProgress?.(event)
+}
 
 function cleanText(value: unknown, max = 2000): string | null {
   if (value === null || value === undefined) return null
@@ -214,16 +254,25 @@ function isLikelyCollectionPage(url: string, platform: string): boolean {
   return false
 }
 
+function mlItemUrlFromSeed(seed: string): string | null {
+  const match = seed.match(/MLM[-_]?(\d+)/i)
+  return match ? `https://auto.mercadolibre.com.mx/MLM-${match[1]}-_JM` : null
+}
+
+function sellerIdFromSeed(seed: string): string | null {
+  return seed.match(/_CustId_(\d+)/i)?.[1] ?? seed.match(/[?&]seller_id=(\d+)/i)?.[1] ?? null
+}
+
 function queryForSeed(seed: string, targetSite: TargetSearchSiteKey, mode: InputMode): string {
   const target = TARGET_SITE_MAP[targetSite]
   if (mode === 'mercadolibre_seller') {
     const custId = seed.match(/_CustId_(\d+)/i)?.[1]
-    const sellerTerm = custId ? `${custId} vehiculos autos` : textFromUrl(seed)
+    const sellerTerm = custId ? `seller ${custId} autos vehiculos MercadoLibre` : textFromUrl(seed)
     return `(site:auto.mercadolibre.com.mx OR site:articulo.mercadolibre.com.mx) MLM ${sellerTerm}`.trim()
   }
   if (targetSite === 'mercadolibre') {
     const text = mode === 'search' ? seed : textFromUrl(seed)
-    return `site:auto.mercadolibre.com.mx/MLM MLM autos ${text}`.trim()
+    return `site:auto.mercadolibre.com.mx/MLM ${text} MercadoLibre auto precio`.trim()
   }
   if (targetSite === 'inmuebles24') {
     const text = mode === 'search' ? seed : textFromUrl(seed)
@@ -283,12 +332,13 @@ function addPriceCandidates(candidate: RawCandidate, text: string | null | undef
   }
 }
 
-async function searchSerpApi(query: string, apiKey: string, limit: number): Promise<SerpOrganicResult[]> {
+async function searchSerpApi(query: string, apiKey: string, limit: number, budget: RunBudget): Promise<SerpOrganicResult[]> {
   const results: SerpOrganicResult[] = []
   const seen = new Set<string>()
   const maxPages = Math.min(5, Math.ceil(limit / 10))
 
   for (let page = 0; page < maxPages && results.length < limit; page++) {
+    budget.useSerpRequest()
     const url = new URL('https://serpapi.com/search.json')
     url.searchParams.set('engine', 'google')
     url.searchParams.set('q', query)
@@ -317,7 +367,8 @@ async function searchSerpApi(query: string, apiKey: string, limit: number): Prom
   return results
 }
 
-async function searchSerpApiImages(query: string, apiKey: string): Promise<SerpImageResult[]> {
+async function searchSerpApiImages(query: string, apiKey: string, budget: RunBudget): Promise<SerpImageResult[]> {
+  budget.useSerpRequest()
   const url = new URL('https://serpapi.com/search.json')
   url.searchParams.set('engine', 'google_images')
   url.searchParams.set('q', query)
@@ -414,15 +465,15 @@ async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite
   }
 }
 
-async function enrichCandidate(candidate: RawCandidate, apiKey: string, params: AiAssistedScrapeParams): Promise<RawCandidate> {
+async function enrichCandidate(candidate: RawCandidate, apiKey: string, params: AiAssistedScrapeParams, budget: RunBudget): Promise<RawCandidate> {
   const enriched = { ...candidate, candidates: { ...candidate.candidates } }
   enriched.candidates.title = [...candidate.candidates.title]
   enriched.candidates.description = [...candidate.candidates.description]
   enriched.candidates.priceCents = [...candidate.candidates.priceCents]
   enriched.candidates.imageUrl = [...candidate.candidates.imageUrl]
 
-  if (params.assistMode !== 'normalize' && (!enriched.priceText || !enriched.htmlDescription || !enriched.htmlTitle)) {
-    const organic = await searchSerpApi(supplementalQuery(enriched), apiKey, 3)
+  if (params.assistMode === 'enrich' && (!enriched.priceText || !enriched.htmlDescription || !enriched.htmlTitle)) {
+    const organic = await searchSerpApi(supplementalQuery(enriched), apiKey, 3, budget)
     for (const result of organic) {
       const snippet = cleanText([result.title, result.snippet].filter(Boolean).join(' - '), 1000)
       if (!snippet) continue
@@ -436,7 +487,7 @@ async function enrichCandidate(candidate: RawCandidate, apiKey: string, params: 
   }
 
   if (params.imageEnrichment !== false && !enriched.imageUrl) {
-    const images = await searchSerpApiImages(imageQuery(enriched), apiKey)
+    const images = await searchSerpApiImages(imageQuery(enriched), apiKey, budget)
     const exact = images.find(image => image.link && normalizedUrl(image.link) === normalizedUrl(enriched.sourceUrl))
     const sameSource = images.find(image => image.original && /^(https?:)?\/\//i.test(image.original) && image.source?.toLowerCase().includes(enriched.sourcePlatform.toLowerCase()))
     const firstUsable = exact ?? sameSource ?? images.find(image => image.original || image.thumbnail)
@@ -461,6 +512,39 @@ function missingFields(candidate: RawCandidate): string[] {
   if (!candidate.priceText && candidate.candidates.priceCents.length === 0) missing.push('price')
   if (!candidate.imageUrl && candidate.candidates.imageUrl.length === 0) missing.push('image_url')
   return missing
+}
+
+function rawCandidateFromUrl(seed: string, targetSite: TargetSearchSiteKey): RawCandidate | null {
+  let sourceUrl: string | null = null
+  const mlItem = mlItemUrlFromSeed(seed)
+  if (mlItem) sourceUrl = mlItem
+  if (!sourceUrl && /^https?:\/\//i.test(seed)) sourceUrl = normalizedUrl(seed)
+  if (!sourceUrl) return null
+
+  const sourcePlatform = sourcePlatformFromUrl(sourceUrl, targetSite)
+  const titleFromUrl = cleanText(textFromUrl(sourceUrl), 300)
+  return {
+    seed,
+    sourceUrl,
+    sourcePlatform,
+    googleTitle: titleFromUrl,
+    googleSnippet: null,
+    htmlTitle: null,
+    htmlDescription: null,
+    imageUrl: null,
+    priceText: null,
+    fetchStatus: 'not_fetched',
+    isItemPage: isLikelyItemPage(sourceUrl, sourcePlatform),
+    isCollectionPage: isLikelyCollectionPage(sourceUrl, sourcePlatform),
+    enrichmentNotes: ['direct_seed_candidate'],
+    supplementalSnippets: [],
+    candidates: {
+      title: titleFromUrl ? [{ value: titleFromUrl, source: 'url:path' }] : [],
+      description: [],
+      priceCents: [],
+      imageUrl: [],
+    },
+  }
 }
 
 function fallbackRow(candidate: RawCandidate, params: AiAssistedScrapeParams): GeminiSupplyRow {
@@ -613,20 +697,67 @@ function rowToItem(row: GeminiSupplyRow, candidate: RawCandidate, params: AiAssi
   })
 }
 
+function urlImageItem(candidate: RawCandidate, params: AiAssistedScrapeParams): ScrapeCollectedItem {
+  const imageUrl = candidate.imageUrl ?? candidate.candidates.imageUrl[0]?.value?.toString() ?? null
+  const hasValidShape = candidate.isItemPage && /^https?:\/\//i.test(candidate.sourceUrl)
+  const notes = [
+    ...candidate.enrichmentNotes,
+    hasValidShape ? 'url_shape_valid' : 'url_shape_needs_manual_validation',
+    imageUrl ? 'image_present' : 'image_missing',
+  ]
+  return withQuality({
+    source_platform: `ai_${candidate.sourcePlatform}`,
+    source_url: candidate.sourceUrl,
+    shop_name: candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null,
+    shop_source_url: candidate.sourcePlatform === 'mercadolibre' ? 'https://www.mercadolibre.com.mx' : candidate.sourcePlatform === 'inmuebles24' ? 'https://www.inmuebles24.com' : null,
+    listing_title: candidate.htmlTitle ?? candidate.googleTitle ?? candidate.candidates.title[0]?.value?.toString() ?? 'Pendiente de revisar',
+    listing_description: candidate.htmlDescription ?? candidate.googleSnippet ?? null,
+    price_cents: candidate.candidates.priceCents[0] ? Number(candidate.candidates.priceCents[0].value) : null,
+    currency: 'MXN',
+    condition: null,
+    listing_type: params.listingType ?? (candidate.sourcePlatform === 'inmuebles24' ? 'rental' : 'product'),
+    category: params.category ?? (candidate.sourcePlatform === 'mercadolibre' ? 'autos' : candidate.sourcePlatform === 'inmuebles24' ? 'inmuebles' : 'otros'),
+    state: params.state ?? null,
+    municipio: params.municipio ?? null,
+    location: params.location ?? null,
+    image_url: imageUrl,
+    raw_data: {
+      ai_confidence: hasValidShape && imageUrl ? 55 : 35,
+      ai_skip_reason: hasValidShape ? null : 'URL/image mode kept this row for manual validation; URL shape may be unavailable or a collection page.',
+      ai_evidence_summary: 'URL/image extraction mode: operator should validate details manually from source URL and image.',
+      ai_missing_fields: missingFields(candidate),
+      raw_candidate: candidate as unknown as Record<string, unknown>,
+      canonical_url: candidate.sourceUrl,
+      original_link_valid: hasValidShape,
+      item_page_detected: candidate.isItemPage,
+      collection_page_detected: candidate.isCollectionPage,
+      enrichment_notes: notes,
+      candidates: candidate.candidates,
+    },
+  }, {
+    parserName: 'ai_assisted_url_image',
+    parserStatus: hasValidShape && imageUrl ? 'url_image_ready' : 'manual_validation_needed',
+    parserAttempts: ['serpapi_google_search', candidate.fetchStatus, 'serpapi_image_enrichment', 'url_shape_validation'],
+    parserNotes: notes,
+  })
+}
+
 export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): Promise<ScrapeCollectResult> {
   const serpApiKey = params.serpApiKey || process.env.SERPAPI_KEY
   const geminiApiKey = params.geminiApiKey || process.env.GEMINI_API_KEY
   if (!serpApiKey) throw new Error('SERPAPI_KEY is not set')
-  if (!geminiApiKey) throw new Error('Gemini API key is required for AI-assisted scrape')
+  if (params.assistMode !== 'url_image' && !geminiApiKey) throw new Error('Gemini API key is required for AI-assisted scrape')
 
   const limit = Math.max(1, Math.min(50, params.limit ?? 20))
   const inputMode = params.inputMode ?? 'search'
   const targetSite = params.targetSite ?? 'mercadolibre'
   const strictItemPages = params.strictItemPages !== false
+  const budget = new RunBudget(params.maxSerpRequests ?? Math.min(80, Math.max(12, limit * 4)), params.maxRuntimeMs ?? 180000)
   const stageLog: string[] = [
     `Input prepared: ${inputMode} / ${targetSite} / limit ${limit}.`,
     'SerpAPI discovery started with item-page-biased queries.',
   ]
+  await progress(params, { phase: 'input', message: stageLog[0], percent: 3 })
   const seeds = inputMode === 'search'
     ? [params.query?.trim()].filter((value): value is string => !!value)
     : splitUrls(params.urls || params.query)
@@ -635,11 +766,21 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
 
   const rawResults: SerpOrganicResult[] = []
   const seenLinks = new Set<string>()
+  const directSeedCandidates: RawCandidate[] = []
 
-  for (const seed of seeds) {
+  for (let seedIndex = 0; seedIndex < seeds.length; seedIndex++) {
+    const seed = seeds[seedIndex]
+    const direct = rawCandidateFromUrl(seed, targetSite)
+    if (direct?.isItemPage) directSeedCandidates.push(direct)
+    if (inputMode === 'mercadolibre_seller' && sellerIdFromSeed(seed)) {
+      const warning = `MercadoLibre seller ID ${sellerIdFromSeed(seed)} cannot be expanded through public ML API or Google index reliably; using SerpAPI fallback query only.`
+      stageLog.push(warning)
+      await progress(params, { phase: 'warning', message: warning, percent: 8 })
+    }
     const query = queryForSeed(seed, targetSite, inputMode)
     const perSeedLimit = Math.max(1, Math.ceil(limit / seeds.length) * (strictItemPages ? 2 : 1))
-    const results = await searchSerpApi(query, serpApiKey, perSeedLimit)
+    await progress(params, { phase: 'serpapi', message: `Fetching candidates with SerpAPI (${seedIndex + 1}/${seeds.length})`, percent: 8 + Math.round((seedIndex / seeds.length) * 18), current: seedIndex + 1, total: seeds.length, itemLabel: seed.slice(0, 80) })
+    const results = await searchSerpApi(query, serpApiKey, perSeedLimit, budget)
     stageLog.push(`SerpAPI query returned ${results.length} candidates: ${query}`)
     for (const result of results) {
       if (!result.link || seenLinks.has(result.link)) continue
@@ -651,25 +792,35 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   }
 
   stageLog.push(`Fetched ${rawResults.length} discovery candidates; extracting page evidence next.`)
+  await progress(params, { phase: 'cleanup', message: `Extracting evidence from ${rawResults.length + directSeedCandidates.length} candidates`, percent: 28 })
   let failed = 0
-  const fetchedCandidates: RawCandidate[] = []
+  const fetchedCandidates: RawCandidate[] = [...directSeedCandidates]
   for (let i = 0; i < rawResults.length; i += 4) {
+    budget.check()
     const batch = rawResults.slice(i, i + 4)
     const batchCandidates = await Promise.all(batch.map(result => fetchEvidence(result, seeds[0] ?? '', targetSite)))
     fetchedCandidates.push(...batchCandidates.filter((item): item is RawCandidate => item !== null))
+    await progress(params, { phase: 'cleanup', message: `Parsed evidence batch ${Math.floor(i / 4) + 1}/${Math.ceil(rawResults.length / 4) || 1}`, percent: 30 + Math.round((i / Math.max(1, rawResults.length)) * 15) })
   }
 
+  const dedupedCandidates = fetchedCandidates.filter((candidate, index, list) =>
+    list.findIndex(item => normalizedUrl(item.sourceUrl) === normalizedUrl(candidate.sourceUrl)) === index
+  )
   const itemCandidates = strictItemPages
-    ? fetchedCandidates.filter(candidate => candidate.isItemPage)
-    : fetchedCandidates.filter(candidate => !candidate.isCollectionPage)
+    ? dedupedCandidates.filter(candidate => candidate.isItemPage)
+    : dedupedCandidates.filter(candidate => !candidate.isCollectionPage)
   const candidatesToEnrich = itemCandidates.slice(0, limit)
-  const skippedCollectionPages = fetchedCandidates.length - candidatesToEnrich.length
+  const skippedCollectionPages = dedupedCandidates.length - candidatesToEnrich.length
   stageLog.push(`Evidence cleanup kept ${candidatesToEnrich.length} item-level rows and filtered ${Math.max(0, skippedCollectionPages)} weak/search pages.`)
+  await progress(params, { phase: 'cleanup', message: `Kept ${candidatesToEnrich.length} item-level rows; filtered ${Math.max(0, skippedCollectionPages)} weak/search pages`, percent: 45 })
 
   const enrichedCandidates: RawCandidate[] = []
-  for (const candidate of candidatesToEnrich) {
+  for (let index = 0; index < candidatesToEnrich.length; index++) {
+    budget.check()
+    const candidate = candidatesToEnrich[index]
     const before = missingFields(candidate)
-    const enriched = await enrichCandidate(candidate, serpApiKey, params)
+    await progress(params, { phase: 'enrichment', message: `Enriching missing price/image evidence (${index + 1}/${candidatesToEnrich.length})`, percent: 45 + Math.round((index / Math.max(1, candidatesToEnrich.length)) * 25), current: index + 1, total: candidatesToEnrich.length, itemLabel: candidate.googleTitle ?? candidate.sourceUrl })
+    const enriched = await enrichCandidate(candidate, serpApiKey, params, budget)
     const after = missingFields(enriched)
     enriched.enrichmentNotes.push(`missing_before:${before.join('|') || 'none'}`)
     enriched.enrichmentNotes.push(`missing_after:${after.join('|') || 'none'}`)
@@ -678,14 +829,23 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   const imageCount = enrichedCandidates.filter(candidate => candidate.imageUrl || candidate.candidates.imageUrl.length > 0).length
   const priceCount = enrichedCandidates.filter(candidate => candidate.priceText || candidate.candidates.priceCents.length > 0).length
   stageLog.push(`Missing-field enrichment complete: ${priceCount}/${enrichedCandidates.length} have price evidence, ${imageCount}/${enrichedCandidates.length} have image evidence.`)
-  stageLog.push('Gemini validation and schema polishing started item by item.')
+  stageLog.push(params.assistMode === 'url_image' ? 'URL/image mode selected; skipping Gemini field polishing.' : 'Gemini validation and schema polishing started item by item.')
+  await progress(params, { phase: 'enrichment', message: `Enrichment complete: ${priceCount}/${enrichedCandidates.length} price, ${imageCount}/${enrichedCandidates.length} image`, percent: 70 })
 
   const items: ScrapeCollectedItem[] = []
-  for (const candidate of enrichedCandidates) {
+  for (let index = 0; index < enrichedCandidates.length; index++) {
+    budget.check()
+    const candidate = enrichedCandidates[index]
+    if (params.assistMode === 'url_image') {
+      await progress(params, { phase: 'csv', message: `Preparing URL/image row (${index + 1}/${enrichedCandidates.length})`, percent: 72 + Math.round((index / Math.max(1, enrichedCandidates.length)) * 23), current: index + 1, total: enrichedCandidates.length, itemLabel: candidate.googleTitle ?? candidate.sourceUrl })
+      items.push(urlImageItem(candidate, params))
+      continue
+    }
     const notes: string[] = []
     let row: GeminiSupplyRow
     try {
-      row = await normalizeWithGemini(candidate, params, geminiApiKey)
+      await progress(params, { phase: 'gemini', message: `${params.assistMode === 'normalize' ? 'Normalizing' : 'Validating and polishing'} with Gemini (${index + 1}/${enrichedCandidates.length})`, percent: 72 + Math.round((index / Math.max(1, enrichedCandidates.length)) * 23), current: index + 1, total: enrichedCandidates.length, itemLabel: candidate.googleTitle ?? candidate.sourceUrl })
+      row = await normalizeWithGemini(candidate, params, geminiApiKey!)
     } catch (error) {
       failed++
       notes.push(String(error).slice(0, 160))
@@ -695,6 +855,7 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   }
 
   stageLog.push(`Gemini output cleanup finished: ${items.length} rows ready for review/export, ${failed} AI fallback rows.`)
+  await progress(params, { phase: 'done', message: `Output cleanup finished: ${items.length} rows ready`, percent: 100, current: items.length, total: items.length })
   const stats = summarizeCollectedItems(items, {
     fetched: rawResults.length,
     parsed: items.length,

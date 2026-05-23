@@ -79,6 +79,16 @@ interface RunResult {
   }
 }
 
+interface AiProgressState {
+  phase: string
+  message: string
+  percent: number
+  current?: number
+  total?: number
+  itemLabel?: string
+  log: string[]
+}
+
 /* ── Editable row for validation ────────────────────── */
 
 interface EditableItem {
@@ -96,6 +106,10 @@ interface EditableItem {
   category: string
   listing_type: string
   condition: string
+  ai_confidence: string
+  ai_summary: string
+  ai_missing_fields: string
+  parser_status: string
   candidates: {
     title: FieldCandidate[]
     description: FieldCandidate[]
@@ -166,6 +180,10 @@ function scrapeItemToEditable(item: ScrapeItem, idx: number): EditableItem {
     category: item.category ?? '',
     listing_type: item.listing_type ?? '',
     condition: item.condition ?? '',
+    ai_confidence: item.raw_data?.ai_confidence === null || item.raw_data?.ai_confidence === undefined ? '' : String(item.raw_data.ai_confidence),
+    ai_summary: typeof item.raw_data?.ai_evidence_summary === 'string' ? item.raw_data.ai_evidence_summary : '',
+    ai_missing_fields: Array.isArray(item.raw_data?.ai_missing_fields) ? item.raw_data.ai_missing_fields.join(', ') : '',
+    parser_status: typeof item.raw_data?.parser_status === 'string' ? item.raw_data.parser_status : '',
     candidates: {
       title: cands?.title ?? [],
       description: cands?.description ?? [],
@@ -256,6 +274,15 @@ const ML_SEARCH_CATEGORIES = [
   { value: 'services', label: 'Services' },
   { value: 'electronics', label: 'Electronics' },
   { value: 'home', label: 'Home' },
+]
+
+const LOCATION_OPTIONS = [
+  { location: 'Ciudad de México, Mexico', state: 'Ciudad de México', municipios: ['Cuauhtémoc', 'Miguel Hidalgo', 'Benito Juárez', 'Coyoacán', 'Álvaro Obregón', 'Tlalpan', 'Venustiano Carranza', 'Azcapotzalco', 'Iztacalco', 'Iztapalapa'] },
+  { location: 'Estado de México, Mexico', state: 'Estado de México', municipios: ['Naucalpan de Juárez', 'Tlalnepantla de Baz', 'Huixquilucan', 'Atizapán de Zaragoza', 'Ecatepec de Morelos', 'Metepec', 'Toluca'] },
+  { location: 'Jalisco, Mexico', state: 'Jalisco', municipios: ['Guadalajara', 'Zapopan', 'Tlaquepaque', 'Tlajomulco de Zúñiga'] },
+  { location: 'Nuevo León, Mexico', state: 'Nuevo León', municipios: ['Monterrey', 'San Pedro Garza García', 'San Nicolás de los Garza', 'Guadalupe', 'Santa Catarina'] },
+  { location: 'Querétaro, Mexico', state: 'Querétaro', municipios: ['Querétaro', 'El Marqués', 'Corregidora'] },
+  { location: 'Puebla, Mexico', state: 'Puebla', municipios: ['Puebla', 'San Andrés Cholula', 'San Pedro Cholula'] },
 ]
 
 /* ── Candidate Picker Component ──────────────────────── */
@@ -415,11 +442,13 @@ function ValidationTable({
             </p>
           </div>
           <div style={{ display: 'flex', gap: 10 }}>
-            <button onClick={onCancel} style={{
+            <button onClick={() => {
+              if (window.confirm('Discard these scraped results? Export or keep reviewing if you still need them.')) onCancel()
+            }} style={{
               padding: '8px 18px', borderRadius: 6, border: '1px solid #d1d5db',
               backgroundColor: '#fff', color: '#374151', fontSize: 13,
               fontWeight: 600, cursor: 'pointer',
-            }}>Cancel</button>
+            }}>Discard</button>
             <button onClick={onExport} style={{
               padding: '8px 22px', borderRadius: 6, border: 'none',
               background: 'linear-gradient(135deg, #4f46e5, #6366f1)',
@@ -487,6 +516,11 @@ function ValidationTable({
                       has candidates
                     </span>
                   )}
+                  {item.ai_confidence && (
+                    <span style={{ fontSize: 10, color: '#0369a1', backgroundColor: '#e0f2fe', padding: '2px 6px', borderRadius: 10, fontWeight: 600 }}>
+                      AI {item.ai_confidence}
+                    </span>
+                  )}
                   <span style={{ fontSize: 18, color: '#9ca3af', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>▾</span>
                 </div>
 
@@ -501,15 +535,25 @@ function ValidationTable({
                       </a>
                     </div>
 
+                    {(item.ai_summary || item.ai_missing_fields || item.parser_status) && (
+                      <div style={{ marginBottom: 10, padding: 10, borderRadius: 6, backgroundColor: '#f8fafc', border: '1px solid #e2e8f0', fontSize: 12, color: '#475569', display: 'grid', gap: 4 }}>
+                        {item.parser_status && <span><strong>Parser:</strong> {item.parser_status}</span>}
+                        {item.ai_summary && <span><strong>AI work:</strong> {item.ai_summary}</span>}
+                        {item.ai_missing_fields && <span><strong>Still missing:</strong> {item.ai_missing_fields}</span>}
+                      </div>
+                    )}
+
                     {/* Image preview */}
                     {item.image_url && (
                       <div style={{ marginBottom: 10 }}>
-                        <img
-                          src={item.image_url}
-                          alt="preview"
-                          style={{ maxWidth: 180, maxHeight: 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover' }}
-                          onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
-                        />
+                        <a href={item.image_url} target="_blank" rel="noopener noreferrer" title="Open image in a new tab">
+                          <img
+                            src={item.image_url}
+                            alt="preview"
+                            style={{ maxWidth: 180, maxHeight: 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover' }}
+                            onError={e => { (e.target as HTMLImageElement).style.display = 'none' }}
+                          />
+                        </a>
                       </div>
                     )}
 
@@ -566,20 +610,21 @@ function ValidationTable({
 
 /* ── Result Banner ───────────────────────────────────── */
 
-function ResultBanner({ result, loading, secret, sourceLabelStr }: { result: RunResult | null; loading: boolean; secret: string; sourceLabelStr: string }) {
+function ResultBanner({ result, loading, secret, sourceLabelStr, aiProgress }: { result: RunResult | null; loading: boolean; secret: string; sourceLabelStr: string; aiProgress?: AiProgressState | null }) {
   if (loading) return (
     <div style={{ marginTop: 14, padding: '10px 14px', borderRadius: 6, backgroundColor: '#f0f9ff', border: '1px solid #bae6fd', fontSize: 14 }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <Spinner color="#0369a1" />
-        <span style={{ color: '#0369a1' }}>Scraping in progress…</span>
+        <span style={{ color: '#0369a1' }}>{aiProgress?.message ?? 'Scraping in progress…'}</span>
       </div>
-      {sourceLabelStr === 'ai_assisted' && (
+      {sourceLabelStr === 'ai_assisted' && aiProgress && (
         <div style={{ marginTop: 8, display: 'grid', gap: 3, color: '#075985', fontSize: 12 }}>
-          <span>Fetching candidates with SerpAPI</span>
-          <span>Filtering weak search/category pages</span>
-          <span>Enriching missing prices and images</span>
-          <span>Validating and polishing each row with Gemini</span>
-          <span>Cleaning output for supply CSV export</span>
+          <div style={{ height: 8, backgroundColor: '#bae6fd', borderRadius: 999, overflow: 'hidden' }}>
+            <div style={{ width: `${Math.max(1, Math.min(100, aiProgress.percent))}%`, height: '100%', backgroundColor: '#0284c7', transition: 'width 0.2s ease' }} />
+          </div>
+          <span>{Math.round(aiProgress.percent)}% · {aiProgress.phase}{aiProgress.current && aiProgress.total ? ` · item ${aiProgress.current}/${aiProgress.total}` : ''}</span>
+          {aiProgress.itemLabel && <span style={{ wordBreak: 'break-word' }}>Working on: {aiProgress.itemLabel}</span>}
+          {aiProgress.log.slice(-5).map((entry, index) => <span key={`${index}-${entry}`}>{entry}</span>)}
         </div>
       )}
     </div>
@@ -695,9 +740,11 @@ interface AiAssistedFormState {
   targetSite: string
   category: string
   listingType: 'product' | 'service' | 'rental' | 'digital'
-  assistMode: 'normalize' | 'enrich'
+  assistMode: 'normalize' | 'enrich' | 'url_image'
   imageEnrichment: boolean
   strictItemPages: boolean
+  maxSerpRequests: string
+  maxRuntimeSeconds: string
   location: string
   state: string
   municipio: string
@@ -767,6 +814,8 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     assistMode: 'enrich',
     imageEnrichment: true,
     strictItemPages: true,
+    maxSerpRequests: '40',
+    maxRuntimeSeconds: '180',
     location: 'Ciudad de México, Mexico',
     state: 'Ciudad de México',
     municipio: '',
@@ -779,6 +828,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [mlSellerLoading, setMlSellerLoading] = useState(false)
   const [targetedLoading, setTargetedLoading] = useState(false)
   const [aiResult, setAiResult] = useState<RunResult | null>(null)
+  const [aiProgress, setAiProgress] = useState<AiProgressState | null>(null)
   const [serpResult, setSerpResult] = useState<RunResult | null>(null)
   const [mlResult, setMlResult] = useState<RunResult | null>(null)
   const [mlSellerResult, setMlSellerResult] = useState<RunResult | null>(null)
@@ -935,6 +985,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     e.preventDefault()
     setAiLoading(true)
     setAiResult(null)
+    setAiProgress({ phase: 'input', message: 'Preparing AI-assisted scrape', percent: 1, log: ['Preparing AI-assisted scrape'] })
     const params = {
       inputMode: aiForm.inputMode,
       query: aiForm.query,
@@ -945,26 +996,62 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       assistMode: aiForm.assistMode,
       imageEnrichment: aiForm.imageEnrichment,
       strictItemPages: aiForm.strictItemPages,
+      maxSerpRequests: Number(aiForm.maxSerpRequests),
+      maxRuntimeMs: Number(aiForm.maxRuntimeSeconds) * 1000,
       location: aiForm.location,
       state: aiForm.state,
       municipio: aiForm.municipio,
       limit: Number(aiForm.limit),
     }
     try {
-      const res = await fetch('/api/admin/scrape', {
+      const res = await fetch('/api/admin/scrape/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
         body: JSON.stringify({
-          source: 'ai_assisted_scrape',
-          mode: 'collect_only',
           params,
           apiKey,
           geminiApiKey,
         }),
       })
-      const json = await res.json() as RunResult
-      setAiResult(json)
-      handleScrapeResult(json, 'ai_assisted_scrape', params)
+      if (!res.ok || !res.body) {
+        const json = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as RunResult
+        setAiResult(json)
+        return
+      }
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let finalResult: RunResult | null = null
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          const packet = JSON.parse(line) as { event: string; data: AiProgressState | RunResult }
+          if (packet.event === 'progress') {
+            const event = packet.data as AiProgressState
+            setAiProgress(prev => ({
+              ...event,
+              log: [...(prev?.log ?? []), event.message].slice(-12),
+            }))
+          } else if (packet.event === 'result') {
+            finalResult = packet.data as RunResult
+            setAiResult(finalResult)
+          } else if (packet.event === 'error') {
+            finalResult = packet.data as RunResult
+            setAiResult(finalResult)
+          }
+        }
+      }
+
+      if (finalResult) {
+        handleScrapeResult(finalResult, 'ai_assisted_scrape', params)
+      }
       await fetchRuns()
     } catch (err) {
       setAiResult({ error: String(err) })
@@ -1274,8 +1361,8 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                   }}
                 >
                   <option value="search">Search terms</option>
-                  <option value="urls">Pasted URLs</option>
-                  <option value="mercadolibre_seller">MercadoLibre seller URL</option>
+                  <option value="urls">Search/result or item URLs</option>
+                  <option value="mercadolibre_seller">MercadoLibre seller profile URL</option>
                   <option value="inmuebles24_search">Inmuebles24 search URL</option>
                 </select>
               </div>
@@ -1349,8 +1436,9 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                 <select style={input} value={aiForm.assistMode} onChange={e => setAiForm(f => ({ ...f, assistMode: e.target.value as AiAssistedFormState['assistMode'] }))}>
                   <option value="enrich">Enrich missing fields</option>
                   <option value="normalize">Normalize only</option>
+                  <option value="url_image">URL + image only</option>
                 </select>
-                <p style={hint}>Enrich uses extra SerpAPI lookups before Gemini validation.</p>
+                <p style={hint}>{aiForm.assistMode === 'url_image' ? 'Skips Gemini and prepares rows for manual operator review.' : 'Enrich uses extra SerpAPI lookups before Gemini validation.'}</p>
               </div>
               <div style={{ ...field, display: 'grid', gap: 8, alignContent: 'start' }}>
                 <label style={label}>AI Evidence Controls</label>
@@ -1373,25 +1461,67 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
               </div>
               <div style={field}>
                 <label style={label}>Location</label>
-                <input style={input} value={aiForm.location} onChange={e => setAiForm(f => ({ ...f, location: e.target.value }))} placeholder="Ciudad de México, Mexico" />
+                <select
+                  style={input}
+                  value={aiForm.location}
+                  onChange={e => {
+                    const selected = LOCATION_OPTIONS.find(option => option.location === e.target.value)
+                    setAiForm(f => ({
+                      ...f,
+                      location: e.target.value,
+                      state: selected?.state ?? f.state,
+                      municipio: '',
+                    }))
+                  }}
+                >
+                  {LOCATION_OPTIONS.map(option => <option key={option.location} value={option.location}>{option.location}</option>)}
+                </select>
               </div>
               <div style={field}>
                 <label style={label}>State</label>
-                <input style={input} value={aiForm.state} onChange={e => setAiForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
+                <select
+                  style={input}
+                  value={aiForm.state}
+                  onChange={e => {
+                    const selected = LOCATION_OPTIONS.find(option => option.state === e.target.value)
+                    setAiForm(f => ({
+                      ...f,
+                      state: e.target.value,
+                      location: selected?.location ?? f.location,
+                      municipio: '',
+                    }))
+                  }}
+                >
+                  {LOCATION_OPTIONS.map(option => <option key={option.state} value={option.state}>{option.state}</option>)}
+                </select>
               </div>
               <div style={field}>
                 <label style={label}>Municipio</label>
-                <input style={input} value={aiForm.municipio} onChange={e => setAiForm(f => ({ ...f, municipio: e.target.value }))} placeholder="Cuauhtémoc" />
+                <select style={input} value={aiForm.municipio} onChange={e => setAiForm(f => ({ ...f, municipio: e.target.value }))}>
+                  <option value="">Any / batch default</option>
+                  {(LOCATION_OPTIONS.find(option => option.state === aiForm.state)?.municipios ?? []).map(municipio => (
+                    <option key={municipio} value={municipio}>{municipio}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Max SerpAPI Requests</label>
+                <input style={input} type="number" min={5} max={80} value={aiForm.maxSerpRequests} onChange={e => setAiForm(f => ({ ...f, maxSerpRequests: e.target.value }))} />
+                <p style={hint}>Stops the run before runaway search spend.</p>
+              </div>
+              <div style={field}>
+                <label style={label}>Timeout Seconds</label>
+                <input style={input} type="number" min={30} max={300} value={aiForm.maxRuntimeSeconds} onChange={e => setAiForm(f => ({ ...f, maxRuntimeSeconds: e.target.value }))} />
               </div>
             </div>
-            <button type="submit" style={btn(aiLoading)} disabled={aiLoading || !apiKey || !geminiApiKey || aiMissingInput}>
+            <button type="submit" style={btn(aiLoading)} disabled={aiLoading || !apiKey || (aiForm.assistMode !== 'url_image' && !geminiApiKey) || aiMissingInput}>
               {aiLoading && <Spinner />}
               {aiLoading ? 'Collecting with AI...' : 'Collect AI-Assisted Rows'}
             </button>
             {!apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>SerpAPI key required.</p>}
-            {!geminiApiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>Gemini key required.</p>}
+            {aiForm.assistMode !== 'url_image' && !geminiApiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>Gemini key required.</p>}
           </form>
-          <ResultBanner result={aiResult} loading={aiLoading} secret={secret} sourceLabelStr="ai_assisted" />
+          <ResultBanner result={aiResult} loading={aiLoading} secret={secret} sourceLabelStr="ai_assisted" aiProgress={aiProgress} />
         </div>
 
         {/* ── SerpAPI ─────────────────────────────── */}
