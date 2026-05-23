@@ -110,7 +110,7 @@ function canonicalUrl(html: string, pageUrl: string): string | null {
 }
 
 /** Fetch a page and return parsed listing fields from OG/meta tags + title parsing. */
-async function fetchOgData(url: string): Promise<{
+export async function fetchMercadoLibreOgData(url: string): Promise<{
   title: string | null
   description: string | null
   image: string | null
@@ -174,7 +174,7 @@ async function fetchOgData(url: string): Promise<{
 }
 
 /** Extract seller info from an ML seller page. */
-async function resolveSellerFromUrl(sellerUrl: string): Promise<{
+export async function resolveMercadoLibreSellerFromUrl(sellerUrl: string): Promise<{
   nickname: string
   displayName: string
   pageUrl: string
@@ -203,7 +203,7 @@ async function resolveSellerFromUrl(sellerUrl: string): Promise<{
   // Bare MLM item ID in URL — resolve to seller via OG tags then seller page
   const mlmMatch = sellerUrl.match(/MLM[-_]?(\d+)/i)
   if (mlmMatch) {
-    const { title } = await fetchOgData(sellerUrl)
+    const { title } = await fetchMercadoLibreOgData(sellerUrl)
     if (title) {
       // We have an item but not a seller page — use a synthesised key
       return { nickname: `mlm-item-${mlmMatch[1]}`, displayName: 'ML Seller', pageUrl: sellerUrl }
@@ -323,7 +323,7 @@ export async function collectMLSeller(params: MLSellerScrapeParams): Promise<Scr
     throw new Error('SERPAPI_KEY is not set - required for ML seller scraping')
   }
 
-  const { nickname, displayName, pageUrl: sellerPageUrl } = await resolveSellerFromUrl(sellerUrl)
+  const { nickname, displayName, pageUrl: sellerPageUrl } = await resolveMercadoLibreSellerFromUrl(sellerUrl)
   const collectedItems: { url: string; googleTitle: string }[] = []
   const seenUrls = new Set<string>()
   const maxPages = Math.min(5, Math.ceil(limit / 10))
@@ -372,7 +372,7 @@ export async function collectMLSeller(params: MLSellerScrapeParams): Promise<Scr
       try {
         const itemIdMatch = itemUrl.match(/MLM[-_]?(\d+)/i)
         const mlItemId = itemIdMatch ? `MLM${itemIdMatch[1]}` : null
-        const parsed = await fetchOgData(itemUrl)
+        const parsed = await fetchMercadoLibreOgData(itemUrl)
         const title = parsed.title ?? googleTitle ?? itemUrl
         const sourceUrl = parsed.canonicalUrl ?? itemUrl
 

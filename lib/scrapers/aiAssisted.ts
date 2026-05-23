@@ -1,5 +1,6 @@
 import type { FieldCandidate, ScrapeCollectedItem, ScrapeCollectResult } from '../adminScrapeExport'
 import { TARGET_SEARCH_SITES, type TargetSearchSiteKey } from '../types'
+import { fetchMercadoLibreOgData, resolveMercadoLibreSellerFromUrl } from './mercadolibre'
 import { summarizeCollectedItems, withQuality } from './quality'
 
 type InputMode = 'search' | 'urls' | 'mercadolibre_seller' | 'inmuebles24_search'
@@ -44,6 +45,7 @@ interface SerpOrganicResult {
   displayed_link?: string
   position?: number
   thumbnail?: string
+  seed?: string
 }
 
 interface SerpImageResult {
@@ -57,7 +59,11 @@ interface SerpImageResult {
 interface RawCandidate {
   seed: string
   sourceUrl: string
+  sourceId: string | null
   sourcePlatform: string
+  canonicalUrl: string | null
+  shopName: string | null
+  shopSourceUrl: string | null
   googleTitle: string | null
   googleSnippet: string | null
   htmlTitle: string | null
@@ -69,6 +75,7 @@ interface RawCandidate {
   isCollectionPage: boolean
   enrichmentNotes: string[]
   supplementalSnippets: string[]
+  allImageUrls: string[]
   candidates: {
     title: FieldCandidate[]
     description: FieldCandidate[]
@@ -94,6 +101,12 @@ interface GeminiSupplyRow {
   evidence_summary: string | null
   missing_fields: string[] | null
   skip_reason: string | null
+}
+
+interface SellerContext {
+  nickname: string
+  displayName: string
+  pageUrl: string
 }
 
 const TARGET_SITE_MAP = Object.fromEntries(TARGET_SEARCH_SITES.map(site => [site.key, site]))
@@ -265,11 +278,16 @@ function sellerIdFromSeed(seed: string): string | null {
   return seed.match(/_CustId_(\d+)/i)?.[1] ?? seed.match(/[?&]seller_id=(\d+)/i)?.[1] ?? null
 }
 
+function sellerNicknameFromSeed(seed: string): string | null {
+  return seed.match(/\/(?:pagina|perfil|tienda)\/([A-Za-z0-9_-]+)/i)?.[1] ?? null
+}
+
 function queryForSeed(seed: string, targetSite: TargetSearchSiteKey, mode: InputMode): string {
   const target = TARGET_SITE_MAP[targetSite]
   if (mode === 'mercadolibre_seller') {
-    const custId = seed.match(/_CustId_(\d+)/i)?.[1]
-    const sellerTerm = custId ? `seller ${custId} autos vehiculos MercadoLibre` : textFromUrl(seed)
+    const nickname = sellerNicknameFromSeed(seed)
+    const custId = sellerIdFromSeed(seed)
+    const sellerTerm = nickname ?? (custId ? `_CustId_${custId} ${custId}` : textFromUrl(seed))
     return `(site:auto.mercadolibre.com.mx OR site:articulo.mercadolibre.com.mx) MLM ${sellerTerm}`.trim()
   }
   if (targetSite === 'mercadolibre') {
@@ -306,8 +324,6 @@ function imageQuery(candidate: RawCandidate): string {
 }
 
 function normalizedUrl(url: string): string {
-  const mlm = url.match(/MLM[-_]?(\d+)/i)
-  if (mlm) return `mlm:${mlm[1]}`
   try {
     const parsed = new URL(url)
     parsed.hash = ''
@@ -317,6 +333,32 @@ function normalizedUrl(url: string): string {
     return parsed.toString().replace(/\/$/, '').toLowerCase()
   } catch {
     return url.trim().toLowerCase()
+  }
+}
+
+function sourceKey(url: string | null | undefined): string {
+  if (!url) return ''
+  if (/^mlm:\d+$/i.test(url)) return url.toLowerCase()
+  const mlm = url.match(/MLM[-_]?(\d+)/i)
+  if (mlm) return `mlm:${mlm[1]}`
+  return normalizedUrl(url)
+}
+
+function mlItemIdFromUrl(url: string): string | null {
+  const match = url.match(/MLM[-_]?(\d+)/i)
+  return match ? `MLM${match[1]}` : null
+}
+
+function applySellerContext(candidate: RawCandidate, context: SellerContext | null): RawCandidate {
+  if (!context || candidate.sourcePlatform !== 'mercadolibre') return candidate
+  return {
+    ...candidate,
+    shopName: context.displayName || context.nickname,
+    shopSourceUrl: context.pageUrl,
+    enrichmentNotes: [
+      ...candidate.enrichmentNotes,
+      `seller_context:${context.nickname}`,
+    ],
   }
 }
 
@@ -362,8 +404,9 @@ async function searchSerpApi(query: string, apiKey: string, limit: number, budge
     for (const result of data.organic_results ?? []) {
       if (!result.link) continue
       const link = normalizedUrl(result.link)
-      if (seen.has(link)) continue
-      seen.add(link)
+      const key = sourceKey(link)
+      if (seen.has(key)) continue
+      seen.add(key)
       results.push({ ...result, link })
       if (results.length >= limit) break
     }
@@ -400,7 +443,11 @@ async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite
   const base: RawCandidate = {
     seed,
     sourceUrl,
+    sourceId: mlItemIdFromUrl(sourceUrl),
     sourcePlatform,
+    canonicalUrl: null,
+    shopName: null,
+    shopSourceUrl: null,
     googleTitle: cleanText(result.title, 300),
     googleSnippet: cleanText(result.snippet, 1000),
     htmlTitle: null,
@@ -415,6 +462,7 @@ async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite
       isCollectionPage ? 'collection_url_detected' : 'not_collection_url',
     ],
     supplementalSnippets: [],
+    allImageUrls: [],
     candidates: {
       title: [],
       description: [],
@@ -428,6 +476,36 @@ async function fetchEvidence(result: SerpOrganicResult, seed: string, targetSite
   pushCandidate(base.candidates.imageUrl, base.imageUrl, 'google:thumbnail')
   addPriceCandidates(base, result.title, 'google:title')
   addPriceCandidates(base, result.snippet, 'google:snippet')
+
+  if (sourcePlatform === 'mercadolibre' && isItemPage) {
+    const parsed = await fetchMercadoLibreOgData(sourceUrl)
+    const canonical = parsed.canonicalUrl ?? sourceUrl
+    const mlParsed: RawCandidate = {
+      ...base,
+      sourceUrl: canonical,
+      sourceId: mlItemIdFromUrl(canonical) ?? base.sourceId,
+      canonicalUrl: canonical,
+      htmlTitle: parsed.title,
+      htmlDescription: parsed.description,
+      imageUrl: parsed.image ?? base.imageUrl,
+      priceText: parsed.priceCents ? String(parsed.priceCents / 100) : base.priceText,
+      fetchStatus: parsed.parserNotes.includes('fetch_error') || parsed.parserNotes.includes('fetch_not_ok') ? 'fetch_failed' : 'parsed',
+      isItemPage: isLikelyItemPage(canonical, sourcePlatform),
+      isCollectionPage: isLikelyCollectionPage(canonical, sourcePlatform),
+      allImageUrls: parsed.images,
+      enrichmentNotes: [
+        ...base.enrichmentNotes,
+        'mercadolibre_og_parser',
+        ...parsed.parserNotes.map(note => `ml_${note}`),
+      ],
+    }
+    pushCandidate(mlParsed.candidates.title, parsed.title, 'ml_og:title')
+    pushCandidate(mlParsed.candidates.description, parsed.description, 'ml_og:description')
+    pushCandidate(mlParsed.candidates.imageUrl, parsed.image, 'ml_og:image')
+    for (const image of parsed.images.slice(1, 8)) pushCandidate(mlParsed.candidates.imageUrl, image, 'ml_og:image_alt')
+    pushCandidate(mlParsed.candidates.priceCents, parsed.priceCents, 'ml_og:price')
+    return mlParsed
+  }
 
   try {
     const res = await fetch(sourceUrl, {
@@ -530,7 +608,11 @@ function rawCandidateFromUrl(seed: string, targetSite: TargetSearchSiteKey): Raw
   return {
     seed,
     sourceUrl,
+    sourceId: mlItemIdFromUrl(sourceUrl),
     sourcePlatform,
+    canonicalUrl: null,
+    shopName: null,
+    shopSourceUrl: null,
     googleTitle: titleFromUrl,
     googleSnippet: null,
     htmlTitle: null,
@@ -542,6 +624,7 @@ function rawCandidateFromUrl(seed: string, targetSite: TargetSearchSiteKey): Raw
     isCollectionPage: isLikelyCollectionPage(sourceUrl, sourcePlatform),
     enrichmentNotes: ['direct_seed_candidate'],
     supplementalSnippets: [],
+    allImageUrls: [],
     candidates: {
       title: titleFromUrl ? [{ value: titleFromUrl, source: 'url:path' }] : [],
       description: [],
@@ -557,7 +640,7 @@ function fallbackRow(candidate: RawCandidate, params: AiAssistedScrapeParams): G
     title: candidate.htmlTitle ?? candidate.googleTitle ?? candidate.candidates.title[0]?.value?.toString() ?? null,
     description: candidate.htmlDescription ?? candidate.googleSnippet ?? candidate.supplementalSnippets[0] ?? null,
     price: candidate.candidates.priceCents[0] ? Number(candidate.candidates.priceCents[0].value) / 100 : candidate.priceText,
-    shop_name: candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null,
+    shop_name: candidate.shopName ?? (candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null),
     location: params.location ?? null,
     state: params.state ?? null,
     municipio: params.municipio ?? null,
@@ -660,14 +743,16 @@ function rowToItem(row: GeminiSupplyRow, candidate: RawCandidate, params: AiAssi
   const listingType = cleanText(row.listing_type) ?? params.listingType ?? (candidate.sourcePlatform === 'inmuebles24' ? 'rental' : 'product')
   const condition = cleanText(row.condition)
   const priceCents = parsePriceCents(row.price)
-  const sourceUrl = cleanText(row.source_url, 1000) ?? candidate.sourceUrl
+  const sourceUrl = cleanText(row.source_url, 1000) ?? candidate.canonicalUrl ?? candidate.sourceUrl
   const imageUrl = cleanText(row.image_url, 1000) ?? candidate.imageUrl ?? candidate.candidates.imageUrl[0]?.value?.toString() ?? null
+  const shopName = cleanText(row.shop_name, 200) ?? candidate.shopName ?? (candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null)
 
   return withQuality({
     source_platform: `ai_${candidate.sourcePlatform}`,
     source_url: sourceUrl,
-    shop_name: cleanText(row.shop_name, 200),
-    shop_source_url: candidate.sourcePlatform === 'mercadolibre' ? 'https://www.mercadolibre.com.mx' : candidate.sourcePlatform === 'inmuebles24' ? 'https://www.inmuebles24.com' : null,
+    source_id: candidate.sourceId,
+    shop_name: shopName,
+    shop_source_url: candidate.shopSourceUrl ?? (candidate.sourcePlatform === 'mercadolibre' ? 'https://www.mercadolibre.com.mx' : candidate.sourcePlatform === 'inmuebles24' ? 'https://www.inmuebles24.com' : null),
     listing_title: cleanText(row.title, 200),
     listing_description: cleanText(row.description, 2000),
     price_cents: priceCents,
@@ -686,7 +771,8 @@ function rowToItem(row: GeminiSupplyRow, candidate: RawCandidate, params: AiAssi
       ai_missing_fields: row.missing_fields ?? missingFields(candidate),
       ai_raw_row: row as unknown as Record<string, unknown>,
       raw_candidate: candidate as unknown as Record<string, unknown>,
-      canonical_url: sourceUrl,
+      canonical_url: candidate.canonicalUrl ?? sourceUrl,
+      all_image_urls: candidate.allImageUrls,
       original_link_valid: /^https?:\/\//i.test(sourceUrl),
       item_page_detected: candidate.isItemPage,
       collection_page_detected: candidate.isCollectionPage,
@@ -711,9 +797,10 @@ function urlImageItem(candidate: RawCandidate, params: AiAssistedScrapeParams): 
   ]
   return withQuality({
     source_platform: `ai_${candidate.sourcePlatform}`,
-    source_url: candidate.sourceUrl,
-    shop_name: candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null,
-    shop_source_url: candidate.sourcePlatform === 'mercadolibre' ? 'https://www.mercadolibre.com.mx' : candidate.sourcePlatform === 'inmuebles24' ? 'https://www.inmuebles24.com' : null,
+    source_url: candidate.canonicalUrl ?? candidate.sourceUrl,
+    source_id: candidate.sourceId,
+    shop_name: candidate.shopName ?? (candidate.sourcePlatform === 'mercadolibre' ? 'Vendedor MercadoLibre' : candidate.sourcePlatform === 'inmuebles24' ? 'Inmuebles24' : null),
+    shop_source_url: candidate.shopSourceUrl ?? (candidate.sourcePlatform === 'mercadolibre' ? 'https://www.mercadolibre.com.mx' : candidate.sourcePlatform === 'inmuebles24' ? 'https://www.inmuebles24.com' : null),
     listing_title: candidate.htmlTitle ?? candidate.googleTitle ?? candidate.candidates.title[0]?.value?.toString() ?? 'Pendiente de revisar',
     listing_description: candidate.htmlDescription ?? candidate.googleSnippet ?? null,
     price_cents: candidate.candidates.priceCents[0] ? Number(candidate.candidates.priceCents[0].value) : null,
@@ -731,7 +818,8 @@ function urlImageItem(candidate: RawCandidate, params: AiAssistedScrapeParams): 
       ai_evidence_summary: 'URL/image extraction mode: operator should validate details manually from source URL and image.',
       ai_missing_fields: missingFields(candidate),
       raw_candidate: candidate as unknown as Record<string, unknown>,
-      canonical_url: candidate.sourceUrl,
+      canonical_url: candidate.canonicalUrl ?? candidate.sourceUrl,
+      all_image_urls: candidate.allImageUrls,
       original_link_valid: hasValidShape,
       item_page_detected: candidate.isItemPage,
       collection_page_detected: candidate.isCollectionPage,
@@ -756,7 +844,7 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   const inputMode = params.inputMode ?? 'search'
   const targetSite = params.targetSite ?? 'mercadolibre'
   const strictItemPages = params.strictItemPages !== false
-  const excludedUrls = new Set((params.excludeUrls ?? []).map(normalizedUrl).filter(Boolean))
+  const excludedUrls = new Set((params.excludeUrls ?? []).map(sourceKey).filter(Boolean))
   const budget = new RunBudget(params.maxSerpRequests ?? Math.min(80, Math.max(12, limit * 4)), params.maxRuntimeMs ?? 180000)
   const stageLog: string[] = [
     `Input prepared: ${inputMode} / ${targetSite} / limit ${limit}.`,
@@ -771,16 +859,26 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
 
   const rawResults: SerpOrganicResult[] = []
   const seenLinks = new Set<string>()
-  const directSeedCandidates: RawCandidate[] = []
+  const directSeedResults: SerpOrganicResult[] = []
+  const sellerContexts = new Map<string, SellerContext>()
 
   for (let seedIndex = 0; seedIndex < seeds.length; seedIndex++) {
     const seed = seeds[seedIndex]
     const direct = rawCandidateFromUrl(seed, targetSite)
-    if (direct?.isItemPage) directSeedCandidates.push(direct)
-    if (inputMode === 'mercadolibre_seller' && sellerIdFromSeed(seed)) {
-      const warning = `MercadoLibre seller ID ${sellerIdFromSeed(seed)} cannot be expanded through public ML API or Google index reliably; using SerpAPI fallback query only.`
-      stageLog.push(warning)
-      await progress(params, { phase: 'warning', message: warning, percent: 8 })
+    if (direct?.isItemPage) directSeedResults.push({ link: direct.sourceUrl, title: direct.googleTitle ?? undefined, seed })
+    if (inputMode === 'mercadolibre_seller') {
+      try {
+        const seller = await resolveMercadoLibreSellerFromUrl(seed)
+        sellerContexts.set(seed, seller)
+        stageLog.push(`Resolved MercadoLibre seller context: ${seller.displayName} (${seller.nickname}).`)
+      } catch {
+        const custId = sellerIdFromSeed(seed)
+        if (custId) {
+          const warning = `MercadoLibre seller CustId ${custId} has no public seller API expansion; using item-page Google discovery fallback.`
+          stageLog.push(warning)
+          await progress(params, { phase: 'warning', message: warning, percent: 8 })
+        }
+      }
     }
     const query = queryForSeed(seed, targetSite, inputMode)
     const perSeedLimit = Math.max(1, Math.ceil(limit / seeds.length) * (strictItemPages ? 2 : 1))
@@ -788,34 +886,42 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
     const results = await searchSerpApi(query, serpApiKey, perSeedLimit, budget)
     stageLog.push(`SerpAPI query returned ${results.length} candidates: ${query}`)
     for (const result of results) {
-      if (!result.link || seenLinks.has(result.link)) continue
-      seenLinks.add(result.link)
-      rawResults.push(result)
+      const key = sourceKey(result.link)
+      if (!result.link || seenLinks.has(key)) continue
+      seenLinks.add(key)
+      rawResults.push({ ...result, seed })
       if (rawResults.length >= limit * 2) break
     }
     if (rawResults.length >= limit * 2) break
   }
 
-  stageLog.push(`Fetched ${rawResults.length} discovery candidates; extracting page evidence next.`)
-  await progress(params, { phase: 'cleanup', message: `Extracting evidence from ${rawResults.length + directSeedCandidates.length} candidates`, percent: 28 })
+  const evidenceResults = [...directSeedResults, ...rawResults]
+  stageLog.push(`Fetched ${rawResults.length} discovery candidates plus ${directSeedResults.length} direct item URLs; extracting page evidence next.`)
+  await progress(params, { phase: 'cleanup', message: `Extracting evidence from ${evidenceResults.length} candidates`, percent: 28 })
   let failed = 0
-  const fetchedCandidates: RawCandidate[] = [...directSeedCandidates]
-  for (let i = 0; i < rawResults.length; i += 4) {
+  const fetchedCandidates: RawCandidate[] = []
+  for (let i = 0; i < evidenceResults.length; i += 4) {
     budget.check()
-    const batch = rawResults.slice(i, i + 4)
-    const batchCandidates = await Promise.all(batch.map(result => fetchEvidence(result, seeds[0] ?? '', targetSite)))
+    const batch = evidenceResults.slice(i, i + 4)
+    const batchCandidates = await Promise.all(batch.map(async result => {
+      const seed = result.seed ?? seeds[0] ?? ''
+      const candidate = await fetchEvidence(result, seed, targetSite)
+      return candidate ? applySellerContext(candidate, sellerContexts.get(seed) ?? null) : null
+    }))
     fetchedCandidates.push(...batchCandidates.filter((item): item is RawCandidate => item !== null))
-    await progress(params, { phase: 'cleanup', message: `Parsed evidence batch ${Math.floor(i / 4) + 1}/${Math.ceil(rawResults.length / 4) || 1}`, percent: 30 + Math.round((i / Math.max(1, rawResults.length)) * 15) })
+    await progress(params, { phase: 'cleanup', message: `Parsed evidence batch ${Math.floor(i / 4) + 1}/${Math.ceil(evidenceResults.length / 4) || 1}`, percent: 30 + Math.round((i / Math.max(1, evidenceResults.length)) * 15) })
   }
+  const mlOgParsed = fetchedCandidates.filter(candidate => candidate.enrichmentNotes.includes('mercadolibre_og_parser')).length
+  if (mlOgParsed > 0) stageLog.push(`MercadoLibre OG parser enriched ${mlOgParsed} candidates with canonical URL, price, image, and title evidence before Gemini.`)
 
   const dedupedCandidates = fetchedCandidates.filter((candidate, index, list) =>
-    list.findIndex(item => normalizedUrl(item.sourceUrl) === normalizedUrl(candidate.sourceUrl)) === index
+    list.findIndex(item => sourceKey(item.sourceUrl) === sourceKey(candidate.sourceUrl)) === index
   )
   const itemCandidates = strictItemPages
     ? dedupedCandidates.filter(candidate => candidate.isItemPage)
     : dedupedCandidates.filter(candidate => !candidate.isCollectionPage)
   const freshItemCandidates = excludedUrls.size > 0
-    ? itemCandidates.filter(candidate => !excludedUrls.has(normalizedUrl(candidate.sourceUrl)))
+    ? itemCandidates.filter(candidate => !excludedUrls.has(sourceKey(candidate.sourceUrl)))
     : itemCandidates
   const skippedKnownUrls = itemCandidates.length - freshItemCandidates.length
   const candidatesToEnrich = freshItemCandidates.slice(0, limit)
@@ -873,7 +979,7 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
     fetched: rawResults.length,
     parsed: items.length,
     failed,
-    duplicates: Math.max(0, rawResults.length - fetchedCandidates.length),
+    duplicates: Math.max(0, evidenceResults.length - dedupedCandidates.length),
     invalid: Math.max(0, skippedCollectionPages),
     autoSkipped: Math.max(0, skippedCollectionPages),
   })
