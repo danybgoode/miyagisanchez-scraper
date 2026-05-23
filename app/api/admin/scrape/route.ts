@@ -4,7 +4,8 @@ import { collectSerpApiLocal, scrapeSerpApiLocal } from '@/lib/scrapers/serpapi'
 import { collectMLSeller, scrapeMercadoLibre, scrapeMLSeller } from '@/lib/scrapers/mercadolibre'
 import { collectTargetedWebsiteSearch } from '@/lib/scrapers/targeted'
 import { collectApifyTargetedSearch } from '@/lib/scrapers/apify'
-import { saveScrapeRunItems, scrapeItemsToCsv, type ScrapeCollectResult } from '@/lib/adminScrapeExport'
+import { collectAiAssistedScrape } from '@/lib/scrapers/aiAssisted'
+import { saveScrapeRunItems, scrapeItemsToCsv, supplyItemsToCsv, type ScrapeCollectResult } from '@/lib/adminScrapeExport'
 import type { TargetSearchSiteKey } from '@/lib/types'
 
 function checkSecret(req: NextRequest): boolean {
@@ -22,13 +23,14 @@ export async function POST(req: NextRequest) {
   }
 
   const body = await req.json() as {
-    source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller' | 'targeted_website_search' | 'targeted_apify_actor'
+    source: 'serpapi_google_local' | 'mercadolibre_public' | 'mercadolibre_seller' | 'targeted_website_search' | 'targeted_apify_actor' | 'ai_assisted_scrape'
     mode?: 'collect_only' | 'direct_import'
     params: Record<string, unknown>
     apiKey?: string
     apifyApiKey?: string
+    geminiApiKey?: string
   }
-  const { source, params, apiKey, apifyApiKey } = body
+  const { source, params, apiKey, apifyApiKey, geminiApiKey } = body
   const mode = body.mode ?? 'collect_only'
 
   const hasDb = !!(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
@@ -140,6 +142,25 @@ export async function POST(req: NextRequest) {
         fastMode: params.fastMode !== false,
         vehicleYear: params.vehicleYear ? Number(params.vehicleYear) : undefined,
       })
+    } else if (source === 'ai_assisted_scrape') {
+      result = await collectAiAssistedScrape({
+        inputMode: params.inputMode === 'urls' || params.inputMode === 'mercadolibre_seller' || params.inputMode === 'inmuebles24_search'
+          ? params.inputMode
+          : 'search',
+        query: params.query ? String(params.query) : undefined,
+        urls: params.urls ? String(params.urls) : undefined,
+        targetSite: String(params.targetSite ?? 'mercadolibre') as TargetSearchSiteKey,
+        category: params.category ? String(params.category) : undefined,
+        listingType: params.listingType === 'service' || params.listingType === 'rental' || params.listingType === 'digital'
+          ? params.listingType
+          : 'product',
+        state: params.state ? String(params.state) : undefined,
+        municipio: params.municipio ? String(params.municipio) : undefined,
+        location: params.location ? String(params.location) : undefined,
+        limit: Number(params.limit ?? 20),
+        serpApiKey: apiKey,
+        geminiApiKey,
+      })
     } else if (source === 'mercadolibre_public') {
       throw new Error('ML keyword search remains blocked for Mexico. Use Seller Targeting or the new /supply CSV workflow.')
     } else {
@@ -158,7 +179,9 @@ export async function POST(req: NextRequest) {
       }).eq('id', dbRunId)
     }
 
-    const csvData = !hasDb ? scrapeItemsToCsv(result.items) : undefined
+    const csvData = source === 'ai_assisted_scrape'
+      ? supplyItemsToCsv(result.items)
+      : !hasDb ? scrapeItemsToCsv(result.items) : undefined
 
     return NextResponse.json({
       runId: dbRunId ?? runId,

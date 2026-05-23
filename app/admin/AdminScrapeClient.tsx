@@ -201,6 +201,7 @@ function StatusBadge({ status }: { status: string }) {
 }
 
 function sourceLabel(source: string): string {
+  if (source === 'ai_assisted_scrape') return 'AI Assisted'
   if (source === 'serpapi_google_local') return 'Google Local'
   if (source === 'mercadolibre_seller') return 'ML Seller'
   if (source === 'targeted_website_search') return 'Targeted Search'
@@ -665,11 +666,25 @@ interface TargetedFormState {
   vehicleYear: string
 }
 
+interface AiAssistedFormState {
+  inputMode: 'search' | 'urls' | 'mercadolibre_seller' | 'inmuebles24_search'
+  query: string
+  urls: string
+  targetSite: string
+  category: string
+  listingType: 'product' | 'service' | 'rental' | 'digital'
+  location: string
+  state: string
+  municipio: string
+  limit: string
+}
+
 /* ── Main Component ──────────────────────────────────── */
 
 export default function AdminScrapeClient({ secret }: { secret: string }) {
   const [apiKey, setApiKey] = useState('')
   const [apifyApiKey, setApifyApiKey] = useState('')
+  const [geminiApiKey, setGeminiApiKey] = useState('')
   const [validationMode, setValidationMode] = useState(true)
   const [runs, setRuns] = useState<ScrapeRun[]>([])
 
@@ -717,11 +732,25 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     fastMode: true,
     vehicleYear: '',
   })
+  const [aiForm, setAiForm] = useState<AiAssistedFormState>({
+    inputMode: 'search',
+    query: '',
+    urls: '',
+    targetSite: 'mercadolibre',
+    category: 'autos',
+    listingType: 'product',
+    location: 'Ciudad de México, Mexico',
+    state: 'Ciudad de México',
+    municipio: '',
+    limit: '20',
+  })
 
+  const [aiLoading, setAiLoading] = useState(false)
   const [serpLoading, setSerpLoading] = useState(false)
   const [mlLoading, setMlLoading] = useState(false)
   const [mlSellerLoading, setMlSellerLoading] = useState(false)
   const [targetedLoading, setTargetedLoading] = useState(false)
+  const [aiResult, setAiResult] = useState<RunResult | null>(null)
   const [serpResult, setSerpResult] = useState<RunResult | null>(null)
   const [mlResult, setMlResult] = useState<RunResult | null>(null)
   const [mlSellerResult, setMlSellerResult] = useState<RunResult | null>(null)
@@ -733,6 +762,8 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       if (savedKey) setApiKey(savedKey)
       const savedApifyKey = localStorage.getItem('miyagi_apify_key')
       if (savedApifyKey) setApifyApiKey(savedApifyKey)
+      const savedGeminiKey = localStorage.getItem('miyagi_gemini_key')
+      if (savedGeminiKey) setGeminiApiKey(savedGeminiKey)
       const savedMode = localStorage.getItem('miyagi_validation_mode')
       if (savedMode !== null) setValidationMode(savedMode === 'true')
     }, 0)
@@ -747,6 +778,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   const handleApifyApiKeyChange = (val: string) => {
     setApifyApiKey(val)
     localStorage.setItem('miyagi_apify_key', val)
+  }
+
+  const handleGeminiApiKeyChange = (val: string) => {
+    setGeminiApiKey(val)
+    localStorage.setItem('miyagi_gemini_key', val)
   }
 
   const handleValidationToggle = (val: boolean) => {
@@ -866,6 +902,45 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   }
 
   /* ── Scrape handlers ─────────────────────────────── */
+
+  async function runAiAssisted(e: React.FormEvent) {
+    e.preventDefault()
+    setAiLoading(true)
+    setAiResult(null)
+    const params = {
+      inputMode: aiForm.inputMode,
+      query: aiForm.query,
+      urls: aiForm.urls,
+      targetSite: aiForm.targetSite,
+      category: aiForm.category,
+      listingType: aiForm.listingType,
+      location: aiForm.location,
+      state: aiForm.state,
+      municipio: aiForm.municipio,
+      limit: Number(aiForm.limit),
+    }
+    try {
+      const res = await fetch('/api/admin/scrape', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-admin-secret': secret },
+        body: JSON.stringify({
+          source: 'ai_assisted_scrape',
+          mode: 'collect_only',
+          params,
+          apiKey,
+          geminiApiKey,
+        }),
+      })
+      const json = await res.json() as RunResult
+      setAiResult(json)
+      handleScrapeResult(json, 'ai_assisted_scrape', params)
+      await fetchRuns()
+    } catch (err) {
+      setAiResult({ error: String(err) })
+    } finally {
+      setAiLoading(false)
+    }
+  }
 
   async function runSerpApi(e: React.FormEvent) {
     e.preventDefault()
@@ -1034,6 +1109,8 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
   const hint: React.CSSProperties = {
     fontSize: 11, color: '#9ca3af', marginTop: 3,
   }
+  const aiNeedsUrls = aiForm.inputMode !== 'search'
+  const aiMissingInput = aiNeedsUrls ? !aiForm.urls.trim() : !aiForm.query.trim()
 
   return (
     <div style={{ minHeight: '100vh', backgroundColor: '#f3f4f6', fontFamily: 'system-ui, -apple-system, sans-serif' }}>
@@ -1125,6 +1202,138 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
               </p>
             </div>
           </div>
+        </div>
+
+        {/* AI assisted scrape */}
+        <div style={{ ...card, border: '2px solid #0f766e' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 4 }}>
+            <h2 style={{ ...sectionTitle, margin: 0 }}>AI Assisted Scrape</h2>
+            <span style={{ backgroundColor: '#ecfdf5', color: '#047857', fontSize: 12, fontWeight: 600, padding: '2px 8px', borderRadius: 20, border: '1px solid #99f6e4' }}>SerpAPI + Gemini</span>
+          </div>
+          <p style={sectionSub}>
+            Discover marketplace rows with SerpAPI, normalize each item with Gemini, then review and export the supply CSV schema.
+          </p>
+          <form onSubmit={(e) => { void runAiAssisted(e) }}>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+              <div style={field}>
+                <label style={label}>Gemini API Key</label>
+                <input
+                  style={input}
+                  type="password"
+                  value={geminiApiKey}
+                  onChange={e => handleGeminiApiKeyChange(e.target.value)}
+                  placeholder="Paste your Gemini API key here (saved locally)"
+                />
+                <p style={hint}>Required only for this AI-assisted card.</p>
+              </div>
+              <div style={field}>
+                <label style={label}>Input Type</label>
+                <select
+                  style={input}
+                  value={aiForm.inputMode}
+                  onChange={e => {
+                    const inputMode = e.target.value as AiAssistedFormState['inputMode']
+                    setAiForm(f => ({
+                      ...f,
+                      inputMode,
+                      targetSite: inputMode === 'inmuebles24_search' ? 'inmuebles24' : inputMode === 'mercadolibre_seller' ? 'mercadolibre' : f.targetSite,
+                      category: inputMode === 'inmuebles24_search' ? 'inmuebles' : inputMode === 'mercadolibre_seller' ? 'autos' : f.category,
+                      listingType: inputMode === 'inmuebles24_search' ? 'rental' : inputMode === 'mercadolibre_seller' ? 'product' : f.listingType,
+                    }))
+                  }}
+                >
+                  <option value="search">Search terms</option>
+                  <option value="urls">Pasted URLs</option>
+                  <option value="mercadolibre_seller">MercadoLibre seller URL</option>
+                  <option value="inmuebles24_search">Inmuebles24 search URL</option>
+                </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Marketplace</label>
+                <select
+                  style={input}
+                  value={aiForm.targetSite}
+                  onChange={e => {
+                    const targetSite = e.target.value
+                    setAiForm(f => ({
+                      ...f,
+                      targetSite,
+                      category: targetSite === 'mercadolibre' ? 'autos' : 'inmuebles',
+                      listingType: targetSite === 'mercadolibre' ? 'product' : 'rental',
+                    }))
+                  }}
+                >
+                  <option value="mercadolibre">MercadoLibre Autos</option>
+                  <option value="inmuebles24">Inmuebles24</option>
+                </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Limit</label>
+                <input style={input} type="number" min={1} max={50} value={aiForm.limit} onChange={e => setAiForm(f => ({ ...f, limit: e.target.value }))} />
+              </div>
+              {aiNeedsUrls ? (
+                <div style={{ ...field, gridColumn: '1 / -1' }}>
+                  <label style={label}>{aiForm.inputMode === 'mercadolibre_seller' ? 'MercadoLibre Seller URL' : aiForm.inputMode === 'inmuebles24_search' ? 'Inmuebles24 Search URL' : 'URLs'}</label>
+                  <textarea
+                    style={{ ...input, minHeight: 86, resize: 'vertical', fontSize: 13 }}
+                    value={aiForm.urls}
+                    onChange={e => setAiForm(f => ({ ...f, urls: e.target.value }))}
+                    placeholder={aiForm.inputMode === 'mercadolibre_seller'
+                      ? 'https://vehiculos.mercadolibre.com.mx/_CustId_3155163584'
+                      : aiForm.inputMode === 'inmuebles24_search'
+                      ? 'https://www.inmuebles24.com/departamentos-en-renta-en-roma-norte-ciudad-de-cuauhtemoc.html'
+                      : 'One URL per line'}
+                    required
+                  />
+                </div>
+              ) : (
+                <div style={{ ...field, gridColumn: '1 / -1' }}>
+                  <label style={label}>Search Terms</label>
+                  <input
+                    style={input}
+                    value={aiForm.query}
+                    onChange={e => setAiForm(f => ({ ...f, query: e.target.value }))}
+                    placeholder={aiForm.targetSite === 'mercadolibre' ? 'honda civic cdmx usado' : 'departamento roma norte renta'}
+                    required
+                  />
+                </div>
+              )}
+              <div style={field}>
+                <label style={label}>Category</label>
+                <select style={input} value={aiForm.category} onChange={e => setAiForm(f => ({ ...f, category: e.target.value }))}>
+                  {CATEGORIES.map(c => <option key={c.key} value={c.key}>{c.label}</option>)}
+                </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Listing Type</label>
+                <select style={input} value={aiForm.listingType} onChange={e => setAiForm(f => ({ ...f, listingType: e.target.value as AiAssistedFormState['listingType'] }))}>
+                  <option value="product">product</option>
+                  <option value="rental">rental</option>
+                  <option value="service">service</option>
+                  <option value="digital">digital</option>
+                </select>
+              </div>
+              <div style={field}>
+                <label style={label}>Location</label>
+                <input style={input} value={aiForm.location} onChange={e => setAiForm(f => ({ ...f, location: e.target.value }))} placeholder="Ciudad de México, Mexico" />
+              </div>
+              <div style={field}>
+                <label style={label}>State</label>
+                <input style={input} value={aiForm.state} onChange={e => setAiForm(f => ({ ...f, state: e.target.value }))} placeholder="Ciudad de México" />
+              </div>
+              <div style={field}>
+                <label style={label}>Municipio</label>
+                <input style={input} value={aiForm.municipio} onChange={e => setAiForm(f => ({ ...f, municipio: e.target.value }))} placeholder="Cuauhtémoc" />
+              </div>
+            </div>
+            <button type="submit" style={btn(aiLoading)} disabled={aiLoading || !apiKey || !geminiApiKey || aiMissingInput}>
+              {aiLoading && <Spinner />}
+              {aiLoading ? 'Collecting with AI...' : 'Collect AI-Assisted Rows'}
+            </button>
+            {!apiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>SerpAPI key required.</p>}
+            {!geminiApiKey && <p style={{ color: '#dc2626', fontSize: 12, marginTop: 8 }}>Gemini key required.</p>}
+          </form>
+          <ResultBanner result={aiResult} loading={aiLoading} secret={secret} sourceLabelStr="ai_assisted" />
         </div>
 
         {/* ── SerpAPI ─────────────────────────────── */}

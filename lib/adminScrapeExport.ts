@@ -74,6 +74,21 @@ export const SCRAPE_CSV_HEADERS = [
   'condition',
 ] as const
 
+export const SUPPLY_CSV_HEADERS = [
+  'source_url',
+  'title',
+  'description',
+  'price',
+  'shop_name',
+  'location',
+  'state',
+  'municipio',
+  'image_url',
+  'category',
+  'listing_type',
+  'condition',
+] as const
+
 export function priceFromCents(priceCents: number | null | undefined): string {
   if (priceCents === null || priceCents === undefined) return ''
   return (priceCents / 100).toFixed(2)
@@ -104,6 +119,27 @@ export function scrapeItemsToCsv(items: ScrapeCollectedItem[]): string {
       item.raw_data?.parser_status ?? '',
       item.raw_data?.canonical_url ?? '',
       Array.isArray(item.raw_data?.quality_missing) ? item.raw_data.quality_missing.join('|') : '',
+      item.category ?? '',
+      item.listing_type,
+      item.condition ?? '',
+    ].map(csvCell).join(',')),
+  ]
+  return `${lines.join('\n')}\n`
+}
+
+export function supplyItemsToCsv(items: ScrapeCollectedItem[]): string {
+  const lines = [
+    SUPPLY_CSV_HEADERS.join(','),
+    ...items.map(item => [
+      item.source_url ?? '',
+      item.listing_title ?? '',
+      item.listing_description ?? '',
+      priceFromCents(item.price_cents),
+      item.shop_name ?? '',
+      item.location ?? '',
+      item.state ?? '',
+      item.municipio ?? '',
+      item.image_url ?? '',
       item.category ?? '',
       item.listing_type,
       item.condition ?? '',
