@@ -58,6 +58,7 @@ export async function POST(req: NextRequest) {
           strictItemPages: params.strictItemPages !== false,
           maxSerpRequests: params.maxSerpRequests ? Number(params.maxSerpRequests) : undefined,
           maxRuntimeMs: params.maxRuntimeMs ? Number(params.maxRuntimeMs) : undefined,
+          excludeUrls: Array.isArray(params.excludeUrls) ? params.excludeUrls.map(String).slice(0, 500) : undefined,
           onProgress: async (event: AiProgressEvent) => {
             send(controller, 'progress', event)
           },

@@ -95,11 +95,23 @@ interface AiStreamItemEvent {
   total: number
 }
 
+interface ImageUploadResponse {
+  url?: string
+  error?: string
+}
+
+interface ClipboardImageResult {
+  url?: string
+  file?: File
+}
+
 /* ── Editable row for validation ────────────────────── */
 
 interface EditableItem {
   _idx: number
   _included: boolean
+  _duplicate: boolean
+  _duplicate_reason: string
   source_url: string
   title: string
   description: string
@@ -169,11 +181,48 @@ function editableItemsToCsv(items: EditableItem[]): string {
   return `${lines.join('\n')}\n`
 }
 
+function canonicalSourceKey(value: string | null | undefined): string {
+  if (!value) return ''
+  const mlm = value.match(/MLM[-_]?(\d+)/i)
+  if (mlm) return `mlm:${mlm[1]}`
+  try {
+    const parsed = new URL(value)
+    parsed.hash = ''
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      if (/^(utm_|c_|deal_|tracking|fbclid|gclid|click|ref|ref_id|campaign|label|uid|element|content|global_position)/i.test(key)) {
+        parsed.searchParams.delete(key)
+      }
+    }
+    return parsed.toString().replace(/\/$/, '').toLowerCase()
+  } catch {
+    return value.trim().toLowerCase()
+  }
+}
+
+function firstCsvCell(line: string): string {
+  if (!line.startsWith('"')) return line.split(',')[0] ?? ''
+  let value = ''
+  for (let i = 1; i < line.length; i++) {
+    const char = line[i]
+    if (char === '"' && line[i + 1] === '"') {
+      value += '"'
+      i++
+    } else if (char === '"') {
+      break
+    } else {
+      value += char
+    }
+  }
+  return value
+}
+
 function scrapeItemToEditable(item: ScrapeItem, idx: number): EditableItem {
   const cands = item.raw_data?.candidates
   return {
     _idx: idx,
     _included: true,
+    _duplicate: false,
+    _duplicate_reason: '',
     source_url: item.source_url ?? '',
     title: item.listing_title ?? '',
     description: item.listing_description ?? '',
@@ -211,10 +260,10 @@ function downloadCsv(csvData: string, filename: string) {
   URL.revokeObjectURL(url)
 }
 
-async function clipboardImageOrText(): Promise<string | null> {
+async function clipboardImageOrText(): Promise<ClipboardImageResult | null> {
   try {
     const text = await navigator.clipboard.readText()
-    if (/^(https?:|data:image\/)/i.test(text.trim())) return text.trim()
+    if (/^(https?:|data:image\/)/i.test(text.trim())) return { url: text.trim() }
   } catch {}
 
   try {
@@ -223,12 +272,8 @@ async function clipboardImageOrText(): Promise<string | null> {
       const imageType = item.types.find(type => type.startsWith('image/'))
       if (!imageType) continue
       const blob = await item.getType(imageType)
-      return await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader()
-        reader.onload = () => resolve(String(reader.result ?? ''))
-        reader.onerror = () => reject(reader.error)
-        reader.readAsDataURL(blob)
-      })
+      const ext = imageType.split('/')[1]?.replace(/[^a-z0-9]/gi, '') || 'png'
+      return { file: new File([blob], `clipboard-image.${ext}`, { type: imageType }) }
     }
   } catch {}
 
@@ -242,6 +287,23 @@ function fileToDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error)
     reader.readAsDataURL(file)
   })
+}
+
+function isLocalImageValue(value: string): boolean {
+  return /^data:image\//i.test(value)
+}
+
+function useCompactViewport(): boolean {
+  const [compact, setCompact] = useState(false)
+
+  useEffect(() => {
+    const update = () => setCompact(window.innerWidth < 760)
+    update()
+    window.addEventListener('resize', update)
+    return () => window.removeEventListener('resize', update)
+  }, [])
+
+  return compact
 }
 
 function StatusBadge({ status }: { status: string }) {
@@ -421,34 +483,60 @@ function ImageEditor({
   value,
   candidates,
   onChange,
+  onUploadFile,
+  isCompact,
 }: {
   value: string
   candidates: FieldCandidate[]
   onChange: (value: string) => void
+  onUploadFile: (file: File) => Promise<string>
+  isCompact: boolean
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const [uploadStatus, setUploadStatus] = useState<'idle' | 'uploading' | 'uploaded' | 'failed'>('idle')
+  const [uploadMessage, setUploadMessage] = useState('')
+
+  async function applyFile(file: File) {
+    setUploadStatus('uploading')
+    setUploadMessage('Uploading image and converting it to a public URL...')
+    onChange(await fileToDataUrl(file))
+    try {
+      const url = await onUploadFile(file)
+      onChange(url)
+      setUploadStatus('uploaded')
+      setUploadMessage('Image URL ready for CSV import.')
+    } catch (error) {
+      setUploadStatus('failed')
+      setUploadMessage(String(error))
+    }
+  }
 
   async function pasteImage() {
     const next = await clipboardImageOrText()
-    if (next) onChange(next)
+    if (next?.url) {
+      onChange(next.url)
+      setUploadStatus('idle')
+      setUploadMessage('')
+    }
+    if (next?.file) await applyFile(next.file)
   }
 
   async function uploadImage(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
-    onChange(await fileToDataUrl(file))
+    await applyFile(file)
     e.target.value = ''
   }
 
   return (
     <div style={{ display: 'grid', gap: 8 }}>
-      <div style={{ display: 'grid', gridTemplateColumns: value ? '180px 1fr' : '1fr', gap: 12, alignItems: 'start' }}>
+      <div style={{ display: 'grid', gridTemplateColumns: value && !isCompact ? '180px 1fr' : '1fr', gap: 12, alignItems: 'start' }}>
         {value && (
           <a href={value} target="_blank" rel="noopener noreferrer" title="Open image in a new tab">
             <img
               src={value}
               alt="preview"
-              style={{ width: 180, height: 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover', backgroundColor: '#f8fafc' }}
+              style={{ width: isCompact ? '100%' : 180, height: isCompact ? 180 : 120, borderRadius: 6, border: '1px solid #e5e7eb', objectFit: 'cover', backgroundColor: '#f8fafc' }}
               onError={e => { (e.target as HTMLImageElement).style.opacity = '0.35' }}
             />
           </a>
@@ -466,19 +554,42 @@ function ImageEditor({
           <input
             type="text"
             value={value}
-            onChange={e => onChange(e.target.value)}
+            onChange={e => {
+              onChange(e.target.value)
+              setUploadStatus('idle')
+              setUploadMessage('')
+            }}
             placeholder="https://..."
             style={{
-              width: '100%', padding: '4px 6px', border: '1px solid #e5e7eb',
-              borderRadius: 4, fontSize: 12, boxSizing: 'border-box',
+              width: '100%', padding: isCompact ? '10px 12px' : '4px 6px', border: `1px solid ${isLocalImageValue(value) ? '#f59e0b' : '#e5e7eb'}`,
+              borderRadius: 4, fontSize: isCompact ? 16 : 12, boxSizing: 'border-box',
               backgroundColor: '#fff', fontFamily: 'inherit',
             }}
           />
+          {isLocalImageValue(value) && (
+            <div style={{ fontSize: 12, color: '#92400e', backgroundColor: '#fffbeb', border: '1px solid #fde68a', borderRadius: 6, padding: '6px 8px' }}>
+              This is still a local image preview. Upload must finish before the CSV has an importable image URL.
+            </div>
+          )}
+          {uploadMessage && (
+            <div style={{
+              fontSize: 12,
+              color: uploadStatus === 'failed' ? '#991b1b' : uploadStatus === 'uploaded' ? '#166534' : '#075985',
+              backgroundColor: uploadStatus === 'failed' ? '#fef2f2' : uploadStatus === 'uploaded' ? '#f0fdf4' : '#f0f9ff',
+              border: `1px solid ${uploadStatus === 'failed' ? '#fecaca' : uploadStatus === 'uploaded' ? '#bbf7d0' : '#bae6fd'}`,
+              borderRadius: 6,
+              padding: '6px 8px',
+            }}>{uploadMessage}</div>
+          )}
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button type="button" onClick={() => { void pasteImage() }} style={{ padding: '5px 9px', borderRadius: 5, border: '1px solid #d1d5db', backgroundColor: '#fff', cursor: 'pointer', fontSize: 12 }}>Paste</button>
-            <button type="button" onClick={() => fileInputRef.current?.click()} style={{ padding: '5px 9px', borderRadius: 5, border: '1px solid #d1d5db', backgroundColor: '#fff', cursor: 'pointer', fontSize: 12 }}>Upload</button>
+            <button type="button" disabled={uploadStatus === 'uploading'} onClick={() => { void pasteImage() }} style={{ padding: isCompact ? '10px 12px' : '5px 9px', minHeight: isCompact ? 42 : undefined, borderRadius: 5, border: '1px solid #d1d5db', backgroundColor: '#fff', cursor: uploadStatus === 'uploading' ? 'wait' : 'pointer', fontSize: 12 }}>Paste</button>
+            <button type="button" disabled={uploadStatus === 'uploading'} onClick={() => fileInputRef.current?.click()} style={{ padding: isCompact ? '10px 12px' : '5px 9px', minHeight: isCompact ? 42 : undefined, borderRadius: 5, border: '1px solid #d1d5db', backgroundColor: '#fff', cursor: uploadStatus === 'uploading' ? 'wait' : 'pointer', fontSize: 12 }}>Upload</button>
             <input ref={fileInputRef} type="file" accept="image/*" onChange={e => { void uploadImage(e) }} style={{ display: 'none' }} />
-            <button type="button" onClick={() => onChange('')} style={{ padding: '5px 9px', borderRadius: 5, border: '1px solid #fecaca', backgroundColor: '#fff', color: '#b91c1c', cursor: 'pointer', fontSize: 12 }}>Remove</button>
+            <button type="button" onClick={() => {
+              onChange('')
+              setUploadStatus('idle')
+              setUploadMessage('')
+            }} style={{ padding: isCompact ? '10px 12px' : '5px 9px', minHeight: isCompact ? 42 : undefined, borderRadius: 5, border: '1px solid #fecaca', backgroundColor: '#fff', color: '#b91c1c', cursor: 'pointer', fontSize: 12 }}>Remove</button>
           </div>
         </div>
       </div>
@@ -494,9 +605,11 @@ function ValidationTable({
   onExport,
   onCancel,
   sourceName,
+  onUploadImage,
   progress,
   isRunning = false,
   isPaused = false,
+  isCompact = false,
   onPause,
   onResume,
   onStop,
@@ -506,9 +619,11 @@ function ValidationTable({
   onExport: () => void
   onCancel: () => void
   sourceName: string
+  onUploadImage: (file: File) => Promise<string>
   progress?: AiProgressState | null
   isRunning?: boolean
   isPaused?: boolean
+  isCompact?: boolean
   onPause?: () => void
   onResume?: () => void
   onStop?: () => void
@@ -532,9 +647,17 @@ function ValidationTable({
   ]
 
   const cellInput: React.CSSProperties = {
-    width: '100%', padding: '4px 6px', border: '1px solid #e5e7eb',
-    borderRadius: 4, fontSize: 12, boxSizing: 'border-box',
+    width: '100%', padding: isCompact ? '10px 12px' : '4px 6px', border: '1px solid #e5e7eb',
+    borderRadius: 4, fontSize: isCompact ? 16 : 12, boxSizing: 'border-box',
     backgroundColor: '#fff', fontFamily: 'inherit',
+  }
+  const actionButton: React.CSSProperties = {
+    padding: isCompact ? '10px 12px' : '8px 14px',
+    minHeight: isCompact ? 42 : undefined,
+    borderRadius: 6,
+    fontSize: 13,
+    fontWeight: 700,
+    cursor: 'pointer',
   }
 
   return (
@@ -546,19 +669,19 @@ function ValidationTable({
       <div style={{
         backgroundColor: '#fff', flex: 1,
         display: 'flex', flexDirection: 'column',
-        margin: '20px', borderRadius: 12,
+        margin: isCompact ? 0 : '20px', borderRadius: isCompact ? 0 : 12,
         boxShadow: '0 25px 50px rgba(0,0,0,0.25)',
         overflow: 'hidden',
       }}>
         {/* Header */}
         <div style={{
-          padding: '16px 24px', borderBottom: '1px solid #e5e7eb',
+          padding: isCompact ? '12px 12px' : '16px 24px', borderBottom: '1px solid #e5e7eb',
           display: 'grid', gap: 12,
           background: 'linear-gradient(to right, #f8fafc, #eef2ff)',
         }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 18 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 18, flexDirection: isCompact ? 'column' : 'row' }}>
             <div>
-              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700, color: '#111827' }}>
+              <h2 style={{ margin: 0, fontSize: isCompact ? 16 : 18, fontWeight: 700, color: '#111827' }}>
                 📋 Validate Scraped Data
               </h2>
               <p style={{ margin: '4px 0 0', fontSize: 13, color: '#6b7280' }}>
@@ -566,37 +689,34 @@ function ValidationTable({
                 {' · '}Click <span style={{ color: '#6366f1', fontWeight: 600 }}>⬡</span> to see alternative candidates from different parsers
               </p>
             </div>
-            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', justifyContent: isCompact ? 'stretch' : 'flex-end', width: isCompact ? '100%' : undefined }}>
               {isRunning && onPause && (
                 <button type="button" onClick={onPause} style={{
-                  padding: '8px 14px', borderRadius: 6, border: '1px solid #f59e0b',
+                  ...actionButton, flex: isCompact ? '1 1 120px' : undefined, border: '1px solid #f59e0b',
                   backgroundColor: '#fffbeb', color: '#92400e', fontSize: 13,
-                  fontWeight: 700, cursor: 'pointer',
                 }}>Pause</button>
               )}
               {isPaused && onResume && (
                 <button type="button" onClick={onResume} style={{
-                  padding: '8px 14px', borderRadius: 6, border: '1px solid #0d9488',
+                  ...actionButton, flex: isCompact ? '1 1 120px' : undefined, border: '1px solid #0d9488',
                   backgroundColor: '#f0fdfa', color: '#0f766e', fontSize: 13,
-                  fontWeight: 700, cursor: 'pointer',
                 }}>Resume</button>
               )}
               {(isRunning || isPaused) && onStop && (
                 <button type="button" onClick={onStop} style={{
-                  padding: '8px 14px', borderRadius: 6, border: '1px solid #fecaca',
+                  ...actionButton, flex: isCompact ? '1 1 120px' : undefined, border: '1px solid #fecaca',
                   backgroundColor: '#fff', color: '#b91c1c', fontSize: 13,
-                  fontWeight: 700, cursor: 'pointer',
                 }}>Cancel Run</button>
               )}
               <button type="button" onClick={() => {
                 if (window.confirm('Discard these scraped results? Export or keep reviewing if you still need them.')) onCancel()
               }} style={{
-                padding: '8px 18px', borderRadius: 6, border: '1px solid #d1d5db',
+                ...actionButton, flex: isCompact ? '1 1 120px' : undefined, border: '1px solid #d1d5db',
                 backgroundColor: '#fff', color: '#374151', fontSize: 13,
-                fontWeight: 600, cursor: 'pointer',
+                fontWeight: 600,
               }}>Discard</button>
               <button type="button" onClick={onExport} style={{
-                padding: '8px 22px', borderRadius: 6, border: 'none',
+                ...actionButton, flex: isCompact ? '1 1 100%' : undefined, border: 'none',
                 background: 'linear-gradient(135deg, #4f46e5, #6366f1)',
                 color: '#fff', fontSize: 13, fontWeight: 700, cursor: 'pointer',
                 boxShadow: '0 2px 8px rgba(99,102,241,0.35)',
@@ -629,7 +749,7 @@ function ValidationTable({
         </div>
 
         {/* Table body */}
-        <div style={{ flex: 1, overflowY: 'auto', padding: '0 8px' }}>
+        <div style={{ flex: 1, overflowY: 'auto', padding: isCompact ? '0 6px 96px' : '0 8px' }}>
           {items.length === 0 && (
             <div style={{ margin: 16, padding: 18, border: '1px dashed #cbd5e1', borderRadius: 8, backgroundColor: '#f8fafc', color: '#475569', fontSize: 13 }}>
               Rows will appear here as soon as the scraper validates each listing. You can pause or cancel the run and keep anything already captured.
@@ -654,9 +774,10 @@ function ValidationTable({
                 {/* Row summary bar */}
                 <div
                   style={{
-                    padding: '10px 14px', display: 'flex', alignItems: 'center', gap: 10,
+                    padding: isCompact ? '12px 10px' : '10px 14px', display: 'flex', alignItems: 'center', gap: isCompact ? 8 : 10,
                     cursor: 'pointer', userSelect: 'none',
                     borderBottom: isExpanded ? '1px solid #f3f4f6' : 'none',
+                    flexWrap: isCompact ? 'wrap' : 'nowrap',
                   }}
                   onClick={() => setExpandedRow(isExpanded ? null : idx)}
                 >
@@ -667,7 +788,7 @@ function ValidationTable({
                     onClick={e => e.stopPropagation()}
                     style={{ width: 16, height: 16, accentColor: '#4f46e5', cursor: 'pointer' }}
                   />
-                  <span style={{ fontSize: 13, fontWeight: 600, color: '#111827', flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, color: '#111827', flex: '1 1 180px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                     {item.title || <em style={{ color: '#9ca3af' }}>No title</em>}
                   </span>
                   {item.price && (
@@ -694,12 +815,17 @@ function ValidationTable({
                       AI {item.ai_confidence}
                     </span>
                   )}
+                  {item._duplicate && (
+                    <span style={{ fontSize: 10, color: '#92400e', backgroundColor: '#fffbeb', padding: '2px 6px', borderRadius: 10, fontWeight: 700 }}>
+                      duplicate
+                    </span>
+                  )}
                   <span style={{ fontSize: 18, color: '#9ca3af', transform: isExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.2s' }}>▾</span>
                 </div>
 
                 {/* Expanded editor */}
                 {isExpanded && (
-                  <div style={{ padding: '12px 14px' }}>
+                  <div style={{ padding: isCompact ? '12px 10px' : '12px 14px' }}>
                     {/* Source URL (read only) */}
                     <div style={{ marginBottom: 10 }}>
                       <div style={{ fontSize: 11, fontWeight: 600, color: '#6b7280', marginBottom: 2 }}>Source URL</div>
@@ -715,17 +841,24 @@ function ValidationTable({
                         {item.ai_missing_fields && <span><strong>Still missing:</strong> {item.ai_missing_fields}</span>}
                       </div>
                     )}
+                    {item._duplicate && (
+                      <div style={{ marginBottom: 10, padding: 10, borderRadius: 6, backgroundColor: '#fffbeb', border: '1px solid #fde68a', fontSize: 12, color: '#92400e' }}>
+                        Duplicate: {item._duplicate_reason || 'This source URL already appeared in recent exports.'}
+                      </div>
+                    )}
 
                     <div style={{ marginBottom: 12 }}>
                       <ImageEditor
                         value={item.image_url}
                         candidates={item.candidates.imageUrl}
                         onChange={value => onUpdate(idx, 'image_url', value)}
+                        onUploadFile={onUploadImage}
+                        isCompact={isCompact}
                       />
                     </div>
 
                     {/* Editable fields grid */}
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px 16px' }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: isCompact ? '1fr' : '1fr 1fr', gap: isCompact ? 10 : '8px 16px' }}>
                       {editableFields.map(({ key, label, candidateKey, long }) => {
                         const candidates = candidateKey ? item.candidates[candidateKey] : []
                         const value = String(item[key] ?? '')
@@ -921,10 +1054,12 @@ interface AiAssistedFormState {
 /* ── Main Component ──────────────────────────────────── */
 
 export default function AdminScrapeClient({ secret }: { secret: string }) {
+  const isCompact = useCompactViewport()
   const [apiKey, setApiKey] = useState('')
   const [apifyApiKey, setApifyApiKey] = useState('')
   const [geminiApiKey, setGeminiApiKey] = useState('')
   const [validationMode, setValidationMode] = useState(true)
+  const [skipKnownDuplicates, setSkipKnownDuplicates] = useState(true)
   const [runs, setRuns] = useState<ScrapeRun[]>([])
 
   // Validation state
@@ -1015,6 +1150,8 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       if (savedGeminiKey) setGeminiApiKey(savedGeminiKey)
       const savedMode = localStorage.getItem('miyagi_validation_mode')
       if (savedMode !== null) setValidationMode(savedMode === 'true')
+      const savedSkipDuplicates = localStorage.getItem('miyagi_skip_known_duplicates')
+      if (savedSkipDuplicates !== null) setSkipKnownDuplicates(savedSkipDuplicates === 'true')
     }, 0)
     return () => window.clearTimeout(timer)
   }, [])
@@ -1039,6 +1176,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     localStorage.setItem('miyagi_validation_mode', String(val))
   }
 
+  const handleSkipKnownDuplicatesToggle = (val: boolean) => {
+    setSkipKnownDuplicates(val)
+    localStorage.setItem('miyagi_skip_known_duplicates', String(val))
+  }
+
   const getLocalRuns = useCallback((): ScrapeRun[] => {
     try {
       const stored = localStorage.getItem('miyagi_local_runs')
@@ -1054,6 +1196,19 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     runs.unshift(run)
     if (runs.length > 20) runs.length = 20
     localStorage.setItem('miyagi_local_runs', JSON.stringify(runs))
+  }, [getLocalRuns])
+
+  const knownSourceKeys = useCallback((): Set<string> => {
+    const keys = new Set<string>()
+    for (const run of getLocalRuns()) {
+      if (!run.csvData) continue
+      const lines = run.csvData.split(/\r?\n/).slice(1)
+      for (const line of lines) {
+        const key = canonicalSourceKey(firstCsvCell(line))
+        if (key) keys.add(key)
+      }
+    }
+    return keys
   }, [getLocalRuns])
 
   const fetchRuns = useCallback(async () => {
@@ -1086,7 +1241,23 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
 
     // If validation mode is ON and we have items, open the validation UI
     if (validationMode && json.items && json.items.length > 0) {
-      const editables = json.items.map((item, i) => scrapeItemToEditable(item, i))
+      const knownKeys = knownSourceKeys()
+      const seenKeys = new Set<string>()
+      const editables = json.items.map((item, i) => {
+        const editable = scrapeItemToEditable(item, i)
+        const key = canonicalSourceKey(editable.source_url)
+        if (key && seenKeys.has(key)) {
+          editable._included = false
+          editable._duplicate = true
+          editable._duplicate_reason = 'Duplicate inside this run.'
+        } else if (key && knownKeys.has(key)) {
+          editable._included = !skipKnownDuplicates
+          editable._duplicate = true
+          editable._duplicate_reason = 'Seen in a recent local export.'
+        }
+        if (key) seenKeys.add(key)
+        return editable
+      })
       setValidatingItems(editables)
       setValidationSource(source)
       return
@@ -1131,20 +1302,30 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
     setValidationSource('ai_assisted_scrape')
     setValidatingItems(prev => {
       const existing = prev ?? []
-      const incomingUrl = (item.source_url ?? '').trim().toLowerCase()
+      const incomingKey = canonicalSourceKey(item.source_url)
       const incomingFallback = `${item.listing_title ?? ''}|${item.image_url ?? ''}`.trim().toLowerCase()
       const alreadyExists = existing.some(row => {
-        const rowUrl = row.source_url.trim().toLowerCase()
-        if (incomingUrl && rowUrl === incomingUrl) return true
-        return !incomingUrl && incomingFallback && `${row.title}|${row.image_url}`.trim().toLowerCase() === incomingFallback
+        const rowKey = canonicalSourceKey(row.source_url)
+        if (incomingKey && rowKey === incomingKey) return true
+        return !incomingKey && incomingFallback && `${row.title}|${row.image_url}`.trim().toLowerCase() === incomingFallback
       })
       if (alreadyExists) return existing
-      return [...existing, scrapeItemToEditable(item, existing.length)]
+      const knownDuplicate = incomingKey ? knownSourceKeys().has(incomingKey) : false
+      if (knownDuplicate && skipKnownDuplicates) return existing
+      const editable = scrapeItemToEditable(item, existing.length)
+      if (knownDuplicate) {
+        editable._included = false
+        editable._duplicate = true
+        editable._duplicate_reason = 'Seen in a recent local export.'
+      }
+      return [...existing, editable]
     })
   }
 
   function handleValidationExport() {
     if (!validatingItems) return
+    const localImageCount = validatingItems.filter(i => i._included && isLocalImageValue(i.image_url)).length
+    if (localImageCount > 0 && !window.confirm(`${localImageCount} included row${localImageCount === 1 ? '' : 's'} still use local image previews instead of public image URLs. Export anyway?`)) return
     const csv = editableItemsToCsv(validatingItems)
     downloadCsv(csv, `scrape_${validationSource}_${Date.now()}.csv`)
     const included = validatingItems.filter(i => i._included).length
@@ -1163,6 +1344,19 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       isLocal: true,
     })
     void fetchRuns()
+  }
+
+  async function uploadSupplyImage(file: File): Promise<string> {
+    const form = new FormData()
+    form.set('file', file)
+    const res = await fetch('/api/admin/images/upload', {
+      method: 'POST',
+      headers: { 'x-admin-secret': secret },
+      body: form,
+    })
+    const json = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as ImageUploadResponse
+    if (!res.ok || !json.url) throw new Error(json.error ?? `Image upload failed with HTTP ${res.status}`)
+    return json.url
   }
 
   /* ── Scrape handlers ─────────────────────────────── */
@@ -1305,6 +1499,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       state: aiForm.state,
       municipio: aiForm.municipio,
       limit: Number(aiForm.limit),
+      excludeUrls: skipKnownDuplicates ? Array.from(knownSourceKeys()).slice(0, 500) : [],
     }
     await runAiAssistedStream(params, true)
   }
@@ -1510,9 +1705,11 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
           onExport={handleValidationExport}
           onCancel={() => setValidatingItems(null)}
           sourceName={sourceLabel(validationSource)}
+          onUploadImage={uploadSupplyImage}
           progress={validationSource === 'ai_assisted_scrape' ? aiProgress : null}
           isRunning={validationSource === 'ai_assisted_scrape' && aiLoading}
           isPaused={validationSource === 'ai_assisted_scrape' && aiPaused}
+          isCompact={isCompact}
           onPause={validationSource === 'ai_assisted_scrape' ? pauseAiAssisted : undefined}
           onResume={validationSource === 'ai_assisted_scrape' ? () => { void resumeAiAssisted() } : undefined}
           onStop={validationSource === 'ai_assisted_scrape' ? cancelAiAssisted : undefined}
@@ -1520,13 +1717,13 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
       )}
 
       {/* Nav */}
-      <div style={{ backgroundColor: '#111827', color: '#fff', padding: '14px 28px', display: 'flex', alignItems: 'center', gap: 12, borderBottom: '1px solid #1f2937' }}>
+      <div style={{ backgroundColor: '#111827', color: '#fff', padding: isCompact ? '12px 14px' : '14px 28px', display: 'flex', alignItems: 'center', gap: 12, borderBottom: '1px solid #1f2937', flexWrap: 'wrap' }}>
         <span style={{ fontWeight: 800, fontSize: 18, letterSpacing: '-0.5px' }}>miyagisanchez</span>
         <span style={{ backgroundColor: '#374151', color: '#d1d5db', fontSize: 12, fontWeight: 600, padding: '2px 8px', borderRadius: 4 }}>ADMIN</span>
-        <span style={{ marginLeft: 'auto', color: '#6b7280', fontSize: 13 }}>Scrape Panel</span>
+        <span style={{ marginLeft: isCompact ? 0 : 'auto', color: '#6b7280', fontSize: 13 }}>Scrape Panel</span>
       </div>
 
-      <div style={{ maxWidth: 900, margin: '0 auto', padding: '32px 24px' }}>
+      <div style={{ maxWidth: 900, margin: '0 auto', padding: isCompact ? '16px 10px 80px' : '32px 24px' }}>
 
         {/* Global Settings */}
         <div style={card}>
@@ -1595,6 +1792,26 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                   : 'Auto-download CSV immediately after scrape.'}
               </p>
             </div>
+            <div style={field}>
+              <label style={label}>Duplicate Guard</label>
+              <label style={{ display: 'flex', alignItems: 'center', gap: 8, minHeight: 38, fontSize: 13, color: '#374151' }}>
+                <input
+                  type="checkbox"
+                  checked={skipKnownDuplicates}
+                  onChange={e => handleSkipKnownDuplicatesToggle(e.target.checked)}
+                  style={{ width: 16, height: 16, accentColor: '#4f46e5' }}
+                />
+                Skip exact URLs seen in recent local CSV exports
+              </label>
+              <p style={hint}>AI-assisted sends these known URLs as exclusions and the review modal also dedupes streamed rows.</p>
+            </div>
+            <div style={field}>
+              <label style={label}>Image Uploads</label>
+              <div style={{ padding: '9px 10px', borderRadius: 6, border: '1px solid #d1d5db', backgroundColor: '#f8fafc', fontSize: 13, color: '#374151' }}>
+                Supabase Storage public URL
+              </div>
+              <p style={hint}>Set SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and optionally SUPABASE_STORAGE_BUCKET. The app creates/uses supply-images by default.</p>
+            </div>
           </div>
         </div>
 
@@ -1608,7 +1825,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
             Discover marketplace rows with SerpAPI, normalize each item with Gemini, then review and export the supply CSV schema.
           </p>
           <form onSubmit={(e) => { void runAiAssisted(e) }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isCompact ? '1fr' : '1fr 1fr', gap: 14 }}>
               <div style={field}>
                 <label style={label}>Gemini API Key</label>
                 <input
@@ -1805,7 +2022,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
           <h2 style={sectionTitle}>🔍 SerpAPI — Google Local</h2>
           <p style={sectionSub}>Collect local businesses from Google Maps and save a CSV for review in /supply. Good for services (talleres, restaurantes, clínicas).</p>
           <form onSubmit={(e) => { void runSerpApi(e) }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isCompact ? '1fr' : '1fr 1fr', gap: 14 }}>
               <div style={field}>
                 <label style={label}>Query</label>
                 <input style={input} value={serpForm.query} onChange={e => setSerpForm(f => ({ ...f, query: e.target.value }))} placeholder="taller mecánico" required />
@@ -1848,7 +2065,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
             Choose the website and collection source first. The fields below only show inputs that the selected source can actually support.
           </p>
           <form onSubmit={(e) => { void runTargeted(e) }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isCompact ? '1fr' : '1fr 1fr', gap: 14 }}>
               <div style={field}>
                 <label style={label}>Source</label>
                 <select
@@ -2088,7 +2305,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
           </div>
           <p style={sectionSub}>MercadoLibre PolicyAgent blocks /sites/MLM/search for non-certified developer apps. This remains disabled for collection; use Seller Targeting below instead.</p>
           <form onSubmit={(e) => { void runML(e) }}>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isCompact ? '1fr' : '1fr 1fr', gap: 14 }}>
               <div style={field}>
                 <label style={label}>Query</label>
                 <input style={input} value={mlForm.query} onChange={e => setMlForm(f => ({ ...f, query: e.target.value }))} placeholder="laptop, iPhone, silla..." required />
@@ -2141,7 +2358,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
                 Formats: mercadolibre.com.mx/pagina/NICKNAME · /perfil/NICKNAME · any listing URL with MLM-XXXXXX
               </p>
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
+            <div style={{ display: 'grid', gridTemplateColumns: isCompact ? '1fr' : '1fr 1fr', gap: 14 }}>
               <div style={field}>
                 <label style={label}>Category</label>
                 <select style={input} value={mlSellerForm.category} onChange={e => setMlSellerForm(f => ({ ...f, category: e.target.value }))}>

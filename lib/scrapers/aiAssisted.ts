@@ -32,6 +32,7 @@ export interface AiAssistedScrapeParams {
   strictItemPages?: boolean
   maxSerpRequests?: number
   maxRuntimeMs?: number
+  excludeUrls?: string[]
   onProgress?: (event: AiProgressEvent) => void | Promise<void>
   onItem?: (item: ScrapeCollectedItem, index: number, total: number) => void | Promise<void>
 }
@@ -305,15 +306,17 @@ function imageQuery(candidate: RawCandidate): string {
 }
 
 function normalizedUrl(url: string): string {
+  const mlm = url.match(/MLM[-_]?(\d+)/i)
+  if (mlm) return `mlm:${mlm[1]}`
   try {
     const parsed = new URL(url)
     parsed.hash = ''
     for (const key of Array.from(parsed.searchParams.keys())) {
-      if (/^(utm_|c_|deal_|tracking|fbclid|gclid)/i.test(key)) parsed.searchParams.delete(key)
+      if (/^(utm_|c_|deal_|tracking|fbclid|gclid|click|ref|ref_id|campaign|label|uid|element|content|global_position)/i.test(key)) parsed.searchParams.delete(key)
     }
-    return parsed.toString()
+    return parsed.toString().replace(/\/$/, '').toLowerCase()
   } catch {
-    return url
+    return url.trim().toLowerCase()
   }
 }
 
@@ -753,6 +756,7 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   const inputMode = params.inputMode ?? 'search'
   const targetSite = params.targetSite ?? 'mercadolibre'
   const strictItemPages = params.strictItemPages !== false
+  const excludedUrls = new Set((params.excludeUrls ?? []).map(normalizedUrl).filter(Boolean))
   const budget = new RunBudget(params.maxSerpRequests ?? Math.min(80, Math.max(12, limit * 4)), params.maxRuntimeMs ?? 180000)
   const stageLog: string[] = [
     `Input prepared: ${inputMode} / ${targetSite} / limit ${limit}.`,
@@ -810,10 +814,14 @@ export async function collectAiAssistedScrape(params: AiAssistedScrapeParams): P
   const itemCandidates = strictItemPages
     ? dedupedCandidates.filter(candidate => candidate.isItemPage)
     : dedupedCandidates.filter(candidate => !candidate.isCollectionPage)
-  const candidatesToEnrich = itemCandidates.slice(0, limit)
+  const freshItemCandidates = excludedUrls.size > 0
+    ? itemCandidates.filter(candidate => !excludedUrls.has(normalizedUrl(candidate.sourceUrl)))
+    : itemCandidates
+  const skippedKnownUrls = itemCandidates.length - freshItemCandidates.length
+  const candidatesToEnrich = freshItemCandidates.slice(0, limit)
   const skippedCollectionPages = dedupedCandidates.length - candidatesToEnrich.length
-  stageLog.push(`Evidence cleanup kept ${candidatesToEnrich.length} item-level rows and filtered ${Math.max(0, skippedCollectionPages)} weak/search pages.`)
-  await progress(params, { phase: 'cleanup', message: `Kept ${candidatesToEnrich.length} item-level rows; filtered ${Math.max(0, skippedCollectionPages)} weak/search pages`, percent: 45 })
+  stageLog.push(`Evidence cleanup kept ${candidatesToEnrich.length} item-level rows, filtered ${Math.max(0, skippedCollectionPages - skippedKnownUrls)} weak/search pages, and skipped ${Math.max(0, skippedKnownUrls)} known URLs.`)
+  await progress(params, { phase: 'cleanup', message: `Kept ${candidatesToEnrich.length} item rows; skipped ${Math.max(0, skippedKnownUrls)} known URLs`, percent: 45 })
 
   const enrichedCandidates: RawCandidate[] = []
   for (let index = 0; index < candidatesToEnrich.length; index++) {
