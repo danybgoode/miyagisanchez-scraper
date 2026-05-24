@@ -1439,6 +1439,7 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
           } else if (packet.event === 'error') {
             finalResult = packet.data as RunResult
             setAiResult(finalResult)
+            updateAiProgress(`Scrape failed: ${finalResult.error ?? 'unknown stream error'}`, 'warning')
           }
         }
       }
@@ -1461,6 +1462,10 @@ export default function AdminScrapeClient({ secret }: { secret: string }) {
             isLocal: true,
           })
         }
+      } else {
+        const message = 'Scrape stream ended before sending final output. Captured rows are still available in the workbench.'
+        setAiResult({ error: message })
+        updateAiProgress(message, 'warning')
       }
       await fetchRuns()
     } catch (err) {

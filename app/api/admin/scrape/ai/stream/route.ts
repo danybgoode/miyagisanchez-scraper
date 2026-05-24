@@ -4,6 +4,9 @@ import { supplyItemsToCsv } from '@/lib/adminScrapeExport'
 import type { ScrapeCollectedItem } from '@/lib/adminScrapeExport'
 import type { TargetSearchSiteKey } from '@/lib/types'
 
+export const maxDuration = 300
+export const dynamic = 'force-dynamic'
+
 function checkSecret(req: NextRequest): boolean {
   const adminSecret = process.env.ADMIN_SECRET
   const secret = req.headers.get('x-admin-secret') ?? req.nextUrl.searchParams.get('secret')
